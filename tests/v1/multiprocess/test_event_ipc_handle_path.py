@@ -204,6 +204,13 @@ def test_worker_surfaces_registration_configuration_error(
         "wrap_kv_caches",
         lambda kv_caches: list(kv_caches.values()),
     )
+    # The bare tensors above carry no out-of-band fds; fd delivery is covered by
+    # the export test and would call ``fd_payload`` on them.
+    monkeypatch.setattr(
+        worker_transfer,
+        "kv_wrapper_fds_delivered",
+        lambda wrappers, fd_channel_path, timeout: nullcontext(),
+    )
     client = MagicMock()
     client.register_kv_cache.return_value = _resolved_future(
         RegisterKVCacheResponse(
