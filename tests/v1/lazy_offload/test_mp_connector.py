@@ -125,7 +125,7 @@ class _FakeSchedulerAdapter:
         self.lookup_requests: list[str] = []
         self.cleaned_up_lookups: list[str] = []
 
-    def end_session(self, request_id: str) -> None:
+    def end_session(self, request_id: str, end_info: Any = None) -> None:
         """Record one LMCache session teardown."""
         self.ended_sessions.append(request_id)
 
@@ -141,6 +141,7 @@ class _FakeSchedulerAdapter:
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
         reserve_last_token: bool = False,
+        include_unfull_chunk: bool = False,
         start: int = 0,
     ) -> None:
         """Record one lookup submission."""
@@ -229,6 +230,10 @@ def _make_connector() -> _Harness:
     # Default config: store only complete prompt chunks, no decode tokens.
     connector._save_decode_cache = False
     connector._prefix_replay_group_ids = ()
+    connector._save_unfull_chunk = False
+    connector._per_request_state_groups = ()
+    connector._pending_end_info = {}
+    connector._vllm_config = SimpleNamespace(model_config=SimpleNamespace())
     return _Harness(connector, manager, adapter)
 
 
@@ -355,6 +360,7 @@ def test_update_connector_output_forwards_receipts_and_applies_actions() -> None
     harness.manager.store_actions = LazyOffloadActions(sessions_to_end=["req"])
     output = SimpleNamespace(
         kv_cache_events=None,
+        finished_sending=set(),
         kv_connector_worker_meta=LMCacheMPWorkerMetadata(
             completed_store_requests={"req": 2},
             failed_store_requests={"req"},
@@ -371,7 +377,9 @@ def test_update_connector_output_ignores_foreign_metadata() -> None:
     harness = _make_connector()
 
     harness.connector.update_connector_output(
-        SimpleNamespace(kv_cache_events=None, kv_connector_worker_meta=None)
+        SimpleNamespace(
+            kv_cache_events=None, finished_sending=set(), kv_connector_worker_meta=None
+        )
     )
 
     assert harness.manager.store_results == []
@@ -380,7 +388,9 @@ def test_update_connector_output_ignores_foreign_metadata() -> None:
 def test_request_finished_forwards_event_and_keeps_lazy_return_contract() -> None:
     harness = _make_connector()
     harness.manager.finished_actions = LazyOffloadActions(sessions_to_end=["finished"])
-    request = SimpleNamespace(request_id="req", kv_transfer_params=None)
+    request = SimpleNamespace(
+        request_id="req", kv_transfer_params=None, status=RequestStatus.WAITING
+    )
 
     delay_free, params = harness.connector.request_finished(request, [])
 

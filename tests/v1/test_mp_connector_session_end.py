@@ -387,6 +387,7 @@ class TestEndSessionDelivery:
         )
         output = SimpleNamespace(
             kv_cache_events=None,
+            finished_sending=set(),
             kv_connector_worker_meta=LMCacheMPWorkerMetadata(
                 completed_store_requests={"req-1": 1}
             ),
@@ -407,6 +408,7 @@ class TestEndSessionDelivery:
 
         output = SimpleNamespace(
             kv_cache_events=None,
+            finished_sending=set(),
             kv_connector_worker_meta=LMCacheMPWorkerMetadata(
                 completed_store_requests={"req-9": 1}
             ),

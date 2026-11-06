@@ -31,11 +31,12 @@ def _tracker(all_token_ids: list[int]) -> LMCacheMPRequestTracker:
     request = SimpleNamespace(
         request_id="req-0",
         cache_salt="",
+        lora_request=None,
         prompt_token_ids=list(range(NUM_PROMPT_TOKENS)),
         all_token_ids=ConstantList(all_token_ids),
         num_prompt_tokens=NUM_PROMPT_TOKENS,
         mm_features=[],
-        sampling_params=SimpleNamespace(extra_args=None),
+        sampling_params=SimpleNamespace(extra_args=None, max_tokens=None),
     )
     tracker = LMCacheMPRequestTracker(request)
     tracker.append_block_ids((list(range(1, 6)), list(range(101, 111))))

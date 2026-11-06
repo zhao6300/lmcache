@@ -55,11 +55,12 @@ def _request(num_tokens: int) -> SimpleNamespace:
         resumable=False,
         status=RequestStatus.WAITING,
         cache_salt="",
+        lora_request=None,
         prompt_token_ids=tokens,
         num_prompt_tokens=num_tokens,
         all_token_ids=ConstantList(tokens),
         mm_features=[],
-        sampling_params=SimpleNamespace(extra_args=None),
+        sampling_params=SimpleNamespace(extra_args=None, max_tokens=None),
         block_hashes=[],
     )
 
@@ -78,6 +79,7 @@ def _connector(hit_tokens: int, window_served: bool) -> LMCacheMPConnector:
     connector.lazy_offload = False
     connector._prefix_replay_tokens = REPLAY_TOKENS
     connector._prefix_replay_group_ids = REPLAY_GROUPS
+    connector._save_unfull_chunk = False
     connector._kv_cache_config = SimpleNamespace(
         prefix_cacheable_group_ids=GLOBAL_GROUPS
     )
