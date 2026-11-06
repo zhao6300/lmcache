@@ -125,6 +125,19 @@ def test_finish_write_and_reserve_read_hands_back_a_locked_object(
     assert l1.finish_read([key(3)]) == {key(3): L1Error.SUCCESS}
 
 
+def test_contains_keys_reports_readable_keys_without_locking(
+    l1: L1ManagerInterface,
+) -> None:
+    assert l1.reserve_write([key(5)], [False], LAYOUT)[key(5)][0] is L1Error.SUCCESS
+    # A key still being written is not readable yet.
+    assert l1.contains_keys([key(5), key(6)]) == [False, False]
+    assert l1.finish_write([key(5)]) == {key(5): L1Error.SUCCESS}
+    assert l1.contains_keys([key(5), key(6)]) == [True, False]
+    # The check took no read lock, so a non-forced delete goes through.
+    assert l1.delete([key(5)]) == {key(5): L1Error.SUCCESS}
+    assert l1.contains_keys([key(5)]) == [False]
+
+
 def test_tags_are_independent_writers(l1: L1ManagerInterface) -> None:
     assert l1.reserve_write([key(4)], [False], LAYOUT, tag="a")[key(4)][0] is (
         L1Error.SUCCESS

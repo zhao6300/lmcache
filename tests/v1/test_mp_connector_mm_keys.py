@@ -59,6 +59,7 @@ class _FakeMMFeature:
 @dataclass
 class _FakeSamplingParams:
     extra_args: dict[str, object] | None = None
+    max_tokens: int | None = None
 
 
 class _FakeRequest:
@@ -200,6 +201,7 @@ def test_eager_prefetch_forwards_request_configs():
         role=KVConnectorRole.SCHEDULER,
         _eager_prefetch=True,
         _reserve_last_token_for_lookup=False,
+        _save_unfull_chunk=False,
         scheduler_adapter=scheduler_adapter,
         _get_or_create_request_tracker=MagicMock(return_value=tracker),
     )
@@ -212,6 +214,7 @@ def test_eager_prefetch_forwards_request_configs():
         cache_salt="",
         request_configs={"lmcache.skip_save": True},
         reserve_last_token=False,
+        include_unfull_chunk=False,
     )
     assert tracker.lookup_started_at is not None
 
@@ -235,6 +238,7 @@ def test_lookup_hint_carries_vllm_prefix_hit() -> None:
     connector.request_trackers = {}
     connector.scheduler_adapter = scheduler_adapter
     connector._reserve_last_token_for_lookup = False
+    connector._save_unfull_chunk = False
     connector.lazy_offload = False
     connector._hit_alignment_tokens = 64
     connector._prefix_replay_tokens = 0
@@ -256,6 +260,7 @@ def test_recurrent_lookup_reserves_final_prompt_token() -> None:
     connector.request_trackers = {}
     connector.scheduler_adapter = scheduler_adapter
     connector._reserve_last_token_for_lookup = True
+    connector._save_unfull_chunk = False
     connector._hit_alignment_tokens = 64
     connector._prefix_replay_tokens = 0
     connector._prefix_replay_group_ids = ()
@@ -271,6 +276,7 @@ def test_recurrent_lookup_reserves_final_prompt_token() -> None:
         cache_salt="",
         request_configs={"lmcache.hint.engine_computed_tokens": 0},
         reserve_last_token=True,
+        include_unfull_chunk=False,
         start=0,
     )
     tracker = connector.request_trackers[request.request_id]

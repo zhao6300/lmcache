@@ -874,6 +874,24 @@ class BaseL1Manager(L1ManagerInterface):
             )
 
     @l1_mgr_synchronized
+    def contains_keys(self, keys: list[ObjectKey]) -> list[bool]:
+        """Return whether each key is resident and readable, without locking it.
+
+        Args:
+            keys: The object keys to check.
+
+        Returns:
+            One flag per key, in order. A key that is only being written is
+            not readable, so it reports False.
+
+        Note:
+            The answer can be stale as soon as this returns: a resident key
+            may be evicted before the caller reads it. Callers that need the
+            object must still take a read lock.
+        """
+        return [key in self._objects for key in keys]
+
+    @l1_mgr_synchronized
     def clear(self, force: bool = False) -> None:
         """Clear objects from L1 cache.
 

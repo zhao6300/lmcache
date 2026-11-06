@@ -74,7 +74,7 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
         requested_tokens=512,
     )
 
-    assert module.wait_prefetch_status("req", timeout=1.0) == 4
+    assert module.wait_prefetch_status("req", timeout=1.0) == 4 * ctx.chunk_size
     ctx.storage_manager.wait_prefetch_status.assert_called_once_with(handle, 1.0)
     ctx.event_bus.publish.assert_called_once()
     # Exactly-once: the job is removed after a non-None result.
@@ -135,6 +135,8 @@ def test_optional_window_locked_only_when_present(window_present, locked_gids):
         ),
     )
 
-    assert module.wait_prefetch_status("req", timeout=1.0) == num_chunks
+    assert (
+        module.wait_prefetch_status("req", timeout=1.0) == num_chunks * ctx.chunk_size
+    )
     session = ctx.session_manager.get_or_create.return_value
     session.record_prefetch_result.assert_called_once_with(num_chunks, locked_gids, {})

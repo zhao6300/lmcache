@@ -334,6 +334,10 @@ class L1ManagerInterface(Protocol):
         """Record an access to the keys; takes no lock."""
         ...
 
+    def contains_keys(self, keys: list[ObjectKey]) -> list[bool]:
+        """Whether each key is resident and readable; takes no lock."""
+        ...
+
     def clear(self, force: bool = False) -> None:
         """Drop every object this L1 is allowed to drop."""
         ...

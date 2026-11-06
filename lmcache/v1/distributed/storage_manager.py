@@ -296,6 +296,7 @@ class StorageManager:
         self,
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
+        is_temporary: bool = False,
     ) -> dict[ObjectKey, MemoryObj]:
         """
         Reserve the object for writing into the storage manager.
@@ -304,6 +305,9 @@ class StorageManager:
             keys (list[ObjectKey]): List of object keys to reserve for writing.
             layout_desc (MemoryLayoutDesc): Description of the memory layout
                 for the objects to be reserved.
+            is_temporary: Store the objects as temporary: L1 deletes each one
+                when its last read lock is released, and never offloads it
+                to L2.
         Returns:
             dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
                 reserved memory objects. Note that not all requested keys could be
@@ -320,7 +324,7 @@ class StorageManager:
             reserve_result.update(
                 self._l1_managers_by_id[owner].reserve_write(
                     keys=group,
-                    is_temporary=[False] * len(group),
+                    is_temporary=[is_temporary] * len(group),
                     layout_desc=layout_desc,
                     tag=_L1_WRITE_TAG,
                 )
@@ -669,6 +673,30 @@ class StorageManager:
         """
         for controller in self._store_controllers.values():
             controller.submit_copy(keys)
+
+    def contains_l1_keys(self, keys: list[ObjectKey]) -> bool:
+        """Return whether every key is resident in some L1, without locking.
+
+        Args:
+            keys: The object keys to check.
+
+        Returns:
+            True when each key is readable in at least one L1.
+
+        Note:
+            The answer can be stale as soon as this returns; a caller that
+            needs the objects must still read-lock them (e.g. with an L1-only
+            prefetch).
+        """
+        resident = [False] * len(keys)
+        for manager in self._l1_managers_by_id.values():
+            resident = [
+                found or in_l1
+                for found, in_l1 in zip(
+                    resident, manager.contains_keys(keys), strict=True
+                )
+            ]
+        return all(resident)
 
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
