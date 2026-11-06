@@ -35,6 +35,9 @@ TAIL_BOUNDARY = (PROMPT - 1) // GRID * GRID
 GROUP_TOKENS_PER_BLOCK = [16, CHUNK]
 MAMBA_BLOCKS = [500, 501, 502]
 BOUNDARY_STATE_BLOCK = 900
+# Engine group 2: a per-request ring, one block for the request's lifetime.
+RING_GROUP = 2
+RING_BLOCK = 900
 
 
 def test_mamba_tail_boundary_is_where_vllm_offered_a_boundary_state():
@@ -160,6 +163,83 @@ def test_unaligned_hit_retrieves_the_unfull_chunk():
     assert meta.op.block_ids == [list(range(21)), MAMBA_BLOCKS]
 
 
+def test_ring_block_rides_with_every_chunk_and_the_unfull_chunk():
+    tracker = _tracker()
+    tracker.append_block_ids(([], [], [RING_BLOCK]))
+    tracker.increase_num_scheduled_tokens(PROMPT)
+
+    meta = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        CHUNK,
+        [*GROUP_TOKENS_PER_BLOCK, 0],
+        per_request_state_groups=(RING_GROUP,),
+    )
+
+    assert meta is not None
+    # The two full chunks each carry the ring block. The prompt's unfull
+    # chunk is stored separately.
+    assert meta.op.block_ids == [
+        list(range(2 * CHUNK // 16)),
+        MAMBA_BLOCKS[:2],
+        [RING_BLOCK] * 2,
+    ]
+
+    # The unfull chunk is a separate store that carries it too.
+    ((tail, _block_ids),) = LMCacheMPRequestMetadata.GetUnfullChunkStoreMetadata(
+        tracker,
+        CHUNK,
+        [*GROUP_TOKENS_PER_BLOCK, 0],
+        GRID,
+        {},
+        (),
+        per_request_state_groups=(RING_GROUP,),
+    )
+    assert tail.op.block_ids[RING_GROUP] == [RING_BLOCK]
+
+
+def test_ring_block_is_retrieved_with_every_chunk():
+    tracker = _tracker()
+    tracker.append_block_ids(([], [], [RING_BLOCK]))
+    tracker.num_lmcache_hit_tokens = PROMPT - 1
+    tracker.state = LMCacheMPRequestState.WAITING_FOR_LOAD
+
+    meta = LMCacheMPRequestMetadata.GetRetrieveMetadata(
+        tracker,
+        CHUNK,
+        [*GROUP_TOKENS_PER_BLOCK, 0],
+        per_request_state_groups=(RING_GROUP,),
+    )
+
+    assert meta is not None
+    assert meta.op.block_ids[RING_GROUP] == [RING_BLOCK] * 3
+
+
+def test_unregistered_ring_is_not_transferred():
+    tracker = _tracker()
+    tracker.append_block_ids(([], [], [RING_BLOCK]))
+    tracker.increase_num_scheduled_tokens(PROMPT)
+
+    meta = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker, CHUNK, [*GROUP_TOKENS_PER_BLOCK, 0]
+    )
+
+    assert meta is not None
+    assert meta.op.block_ids[RING_GROUP] == []
+
+
+def test_lookup_asks_for_the_unfull_chunk_and_keeps_stores_aligned():
+    connector, scheduler_adapter = _connector(lookup_hit=PROMPT - 1)
+
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (PROMPT - 1, True)
+
+    lookup_kwargs = scheduler_adapter.maybe_submit_lookup_request.call_args.kwargs
+    assert lookup_kwargs["include_unfull_chunk"]
+    tracker = connector.request_trackers["req-0"]
+    assert tracker.num_lmcache_hit_tokens == PROMPT - 1
+    assert tracker.num_stored_tokens == 2 * CHUNK
+    assert tracker.unfull_chunk_boundaries == {PROMPT - 1}
+
+
 def test_lookup_asks_for_the_unfull_chunk_on_the_grid():
     connector, scheduler_adapter = _connector(lookup_hit=TAIL_BOUNDARY)
 
@@ -259,6 +339,7 @@ def _connector(lookup_hit: int) -> tuple[LMCacheMPConnector, MagicMock]:
     # prefix-replay windows.
     connector._prefix_replay_group_ids = ()
     connector._prefix_replay_tokens = 0
+    connector._per_request_state_groups = ()
     connector._connector_stats = MagicMock()
     connector.lazy_offload = False
     return connector, scheduler_adapter

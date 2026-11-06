@@ -1,4 +1,4 @@
-# Unfull Chunks
+# Unfull Chunks and Per-Request Ring State
 
 ## Summary
 
@@ -11,11 +11,66 @@ That cost is small for attention-only models but large for hybrid models:
 - The chunk must be a multiple of vLLM's block size, which is 400 to ~1152
   tokens for Qwen3.8, GLM-5.3 and DeepSeek-V4.1. So the thrown-away part is
   large.
-- A Mamba/GDN layer can only resume where its state was saved. Without the
-  state at the end of the cached part, the cached KV is not usable.
+- A linear-attention (Mamba/GDN) layer can only resume where a state snapshot
+  exists, and a compressed-attention layer (QSA, DSA kpool, DSV4.1
+  compressor) can only resume mid-compression-group if the raw keys of the
+  still-open group are available. vLLM keeps those keys in a per-request ring
+  (`CircularBufferSpec`) that LMCache skipped (#5042), which was correct only
+  because LMCache never resumed mid-chunk.
 
-With this feature, LMCache also stores the unfull chunk at the end of a
-prompt, and a lookup can hit part way into a chunk.
+This feature lets LMCache store and load the unfull chunk `[kC, P)` of a
+request together with the ring, so a later request (a decode instance in PD
+disaggregation, or the next round of a chat) resumes at `P` instead of `kC`.
+It is the shared groundwork for PD handoff and multi-round reuse; neither
+policy lives here.
+
+Enabled per connector with `lmcache.mp.save_unfull_chunk: true`
+(`kv_connector_extra_config`). Off by default: nothing changes for existing
+deployments.
+
+## Concepts
+
+- **Unfull chunk**: the token range `[kC, P)` with `kC = floor(P / C) * C`
+  and `0 < P - kC < C`, where `C` is the LMCache chunk size. It is stored as
+  one object per object group with the regular chunk layout, plus one block
+  per narrow sliding-window group (see below); only the blocks that cover
+  `[kC, P)` are copied.
+- **Per-request state group**: a vLLM KV cache group whose request owns one
+  block for its whole lifetime (`CircularBufferSpec`; `KpoolTailSpec` on older
+  vLLM). It is not addressed by token position.
+- **Temporary object**: an L1 object deleted when its last read lock is
+  released (`L1ObjectState.is_temporary`), i.e. read once.
+
+## Ring registration
+
+With the feature on, `create_engine_group_infos_from_vllm` registers ring
+groups as `EngineGroupInfo(per_request_state=True)` instead of excluding them
+with the other scratch groups (HiSparse pools and bounded-replay SWA stay
+excluded). Before format discovery, `_PerRequestStateOpaqueViewEdit`
+re-views each ring layer as `[NB, 1, 1, row]` where `row` is the layer's
+whole per-block span: GLM-5.3's kpool tail pads between its two heads, which
+format discovery rejects, and LMCache never needs per-token addressing of a
+ring.
+
+The server sizes a per-request group as **one block per chunk**
+(`tokens_per_block = chunk_size`). The connector passes the request's single
+ring block once per chunk of every store and retrieve, so the ring rides in
+every object:
+
+```text
+object for chunk i  =  [attention blocks of chunk i] + [ring block]
+```
+
+Why store it with every chunk instead of only with unfull chunks: the object
+layout stays one layout per object group, so lookup, prefetch, eviction and
+L2 need no change. The ring content stored with a full chunk is stale, and
+that is harmless: at a chunk boundary the open compression group is empty
+(block size is a multiple of the compression width, chunk size a multiple of
+block size), so nothing reads the ring before it is overwritten. The cost is
+the ring bytes per chunk (largest for DeepSeek-V4.1's fp32 compressor ring),
+paid only when the feature is on.
+
+## Unfull chunk key
 
 ```text
 prompt, P tokens   |  chunk 0  |  chunk 1  |  chunk 2  | tail |
@@ -47,8 +102,6 @@ Requirements, checked at startup:
 
 - LMCache-driven transfer mode (the CUDA default).
 - No speculative decoding, no `lmcache.mp.lazy_offload`.
-- No compressed-attention model with a per-request ring (DeepSeek-V4.1,
-  GLM-5.3, Qwen3.8-Flash-Next; see [Limits](#limits)).
 - For Mamba hybrids, a vLLM whose `SchedulerOutput` has
   `kv_connector_block_state`.
 
@@ -76,6 +129,18 @@ Requirements, checked at startup:
                                                                       │    end = B (unaligned)       copies the unfull object
                                                                       │    request_configs:          ─> StorageManager
                                                                       │      temporary flag              .reserve_write(is_temporary)
+The connector-side store / lookup / retrieve plan:
+
+store (P = prompt end)                     load (lookup end L)
+------------------------------------       -----------------------------------------
+STORE [s, P), include_unfull_chunk         LOOKUP [0, L), include_unfull_chunk
+  full chunks [s, kC) as today               chunk prefetch -> k full chunks hit
+  + unfull chunk [kC, P):                    if k == floor(L/C): L1-only probe of the
+    blocks: ceil(P/T_g) slices per group       unfull key, read-locked like a chunk
+    ring: the request's ring block           reply k (+1 if the unfull chunk hit)
+    is_temporary from request config       client: hit = min(reply * C, L)
+                                           RETRIEVE [s, L), include_unfull_chunk
+
 ```
 
 No new field travels on the wire. A tail is addressed by an `end` that is not
@@ -90,6 +155,11 @@ the unfull chunk `[kC, end)`.
 | `lmcache.hint.unfull_chunk_grid` | connector | `request_configs` on every LOOKUP key | `LookupModule`, to know which tail lengths to probe. Without it the server probes only the lookup length. |
 | unaligned `end` | connector (LOOKUP, FREE_LOOKUP_LOCKS), worker adapter (STORE, RETRIEVE) | the existing `IPCCacheServerKey.end` | `LookupModule` (probe and release the tail), `LMCacheDrivenTransfer` (copy the tail). |
 | `kv_connector_block_state.boundary_state_offloads` | vLLM | `SchedulerOutput` | Connector, Mamba hybrids only: which boundaries have a saved state and in which block. |
+
+The unfull chunk is a single object per object group. Its per-group block
+list is trimmed to the last `min(n, keep)` blocks, where `keep` is the
+group's per-chunk window in blocks (all blocks for full attention, the last
+window for sliding window, one block for Mamba state and for the ring).
 
 A connector with the feature off sends an aligned LOOKUP `end` and no grid
 hint, so the server never hands it a tail it cannot load. The other transfer
@@ -338,42 +408,93 @@ multiple of `T`.)
   need a lead block. The lead block matters for models whose grid is finer
   than their window blocks, and for exact tails.
 
-### Temporary tails and locks
+## Temporary objects
 
-- `"lmcache.temporary_unfull_chunk": true` stores the request's tail as
-  temporary. L1 deletes it when its last read lock is released and never
-  copies it to L2. If nobody reads it, it is evicted like any other object.
-- Tail read locks are released by:
-  - each worker's retrieve, one lock per key;
-  - FREE_LOOKUP_LOCKS whose `end` equals the tail length (no retrieve is
-    needed because vLLM holds the whole hit, or the servers disagreed);
-  - otherwise the read-lock TTL, like a chunk lock.
+`request_configs["lmcache.temporary_unfull_chunk"] = True` stores the
+request's unfull chunk with `is_temporary`. L1 then deletes it when the last
+read lock of a lookup is released (a retrieve on every worker, or
+`free_lookup_locks` for an unused hit), and never offloads it to L2. An
+unread temporary object is evicted like any other.
+
+## Lookup, locks and sessions
+
+The unfull probe uses `submit_prefetch_task(..., skip_l2=True)`, which reads
+L1 synchronously and takes `num_kv_readers` read locks per key like the chunk
+prefetch. The session records the probed keys and their L1 owners
+separately from the chunk prefetch result:
+
+- each worker's unfull retrieve releases one lock per key;
+- `FREE_LOOKUP_LOCKS` with `include_unfull_chunk` and the lookup's own
+  unaligned `end` releases the remaining locks once (vLLM already holds the
+  tokens, or the servers disagree on hits);
+- anything else is left to the read-lock TTL, like a chunk lock.
+
+## Connector behavior (vLLM MP connector)
+
+- **Store**: the step whose forward computes the prompt's last token `P`
+  (`computed == P`, so the ring and Mamba state describe exactly `P`)
+  extends its store to `[s, P)` when `P % C != 0` and every full chunk up to
+  `kC` is stored by then. At most once per request; a request whose lookup
+  already found the unfull chunk does not store it again.
+  `num_stored_tokens` stays chunk-aligned.
+- **Store invariant**: the unfull chunk's blocks must not be written after
+  its store is submitted. Unlike a full chunk, they are live: the next decode
+  step writes the ring at `position % capacity` and rewrites the Mamba
+  running-state block in place, while the store copies asynchronously on the
+  server stream (nothing orders the next forward after it). The connector
+  therefore stores the unfull chunk only for a request that ends at the
+  prompt (`max_tokens == 1`, e.g. a disaggregated prefill, or a pooling
+  request); the request's blocks are held until the store completes.
+- **Lookup**: sends `end = L` (the lookup token count, after the Mamba
+  reserve-last-token rule) with `include_unfull_chunk`, so a hit can end
+  mid-chunk.
+- **Retrieve**: a hit that ends mid-chunk is retrieved as one operation
+  `[start, L)` with `include_unfull_chunk`.
+- **Overlap with vLLM's prefix cache**: if vLLM already holds tokens past
+  `kC`, loading the unfull chunk would overwrite blocks other requests read,
+  so the connector releases the unfull chunk's locks and keeps the hit at
+  `kC`.
+- **Ring blocks**: every store and retrieve carries the request's ring block
+  once per chunk (`slice_block_ids_per_group(per_request_state_groups=...)`).
+  The scheduler-side geometry (`group_tokens_per_block`, LCM, hit alignment)
+  keeps the ring at `0`: it never constrains chunk alignment.
+- **Startup checks**: the option is rejected with speculative decoding (draft
+  rows sit past `P` in the ring and in relocated Mamba blocks), with
+  `lmcache.mp.lazy_offload`, and when the worker resolves to an
+  engine-driven transfer mode.
 
 ## Limits
 
-- **Compressed-attention models are not supported** (QSA, DSA kpool, DSV4.1
-  compressor) and are rejected at startup. Resuming mid-chunk needs the raw
-  keys of the open compression group, which vLLM keeps in a per-request ring
-  (`CircularBufferSpec`) that LMCache does not store (#5042). Storing the ring
-  is a follow-up.
-- Tails are served from L1 only. A persistent tail copied to L2 is not looked
-  up there, and tails are not shared over P2P L1. P2P lookup of tails is a
-  follow-up for LMCache-native PD.
-- A prompt shorter than one chunk has no full chunk to look up, so its tail is
-  never tried.
-- A lookup checks up to `C / g` tail lengths in L1 (no locks, one hash each).
-  The count is in `MP_LOOKUP_PREFETCH_END` (`unfull_chunk_probes`).
-- Requests with `max_tokens == 1` always store an exact tail. Without PD
+- Served from L1 only (a persistent unfull object offloaded to L2 is not
+  looked up there); LMCache-driven transfer mode only (the CUDA default).
+- A prompt shorter than one chunk has no full chunk to look up, so its
+  unfull chunk is never probed.
+- A failed unfull-chunk retrieve, or a lookup abandoned for an APC-shrink
+  re-lookup (`apc_covered_lookup.md`), leaves the unfull chunk's read locks
+  (and a temporary object) to the read-lock TTL: those releases resolve full
+  chunks only.
+- The copy path is chosen per object group: when the ring's opaque layout is
+  not eligible for the direct-copy path, the object group holding it (the
+  attention one) takes the staging-kernel path for full chunks too.
+- A model with a sliding window narrower than a chunk stores no unfull
+  chunk when an L1 is GDS-backed: GDS copies only through its registered
+  staging buffer, and the lead-block layout does not fit it. Supporting it
+  means a registered unfull staging region per platform.
+- Only the prompt-end tail is stored. Finding the tail of an earlier round
+  (multi-round chat) needs a separate lookup policy; resuming a decode
+  instance at the exact prompt end (PD) additionally needs the prefill side
+  to stop where the decoder resumes.
+- vLLM must accept a non-block-aligned external hit (current vLLM does). DSV4.1
+  with bounded-replay SWA still replays its window after a load because
+  LMCache reports only the prefix-cacheable groups as loaded.
+- A lookup probes up to `C / g` unfull-chunk lengths in L1 (no locks, one
+  hash each); the count is in `MP_LOOKUP_PREFETCH_END`
+  (`unfull_chunk_probes`).
+- Requests with `max_tokens == 1` always store an unfull chunk. Without PD
   nobody reads it, so it only costs L1 space.
 - Mamba backends that save the prompt-tail state inside a prefill chunk offer
   no boundary-state block for it, so only block-end boundaries are stored.
-- Sliding-window blocks below the window can be freed while a tail store is in
-  flight, the same risk as for full-chunk sliding-window stores.
-- A failed tail retrieve, or a lookup dropped for an APC-shrink re-lookup
-  (`apc_covered_lookup.md`), leaves the tail's locks (and a temporary object)
-  to the read-lock TTL.
-- Only prompt tails are stored. A next round hits the previous round's prompt
-  tail, not its generated tokens.
-- vLLM must accept an external hit that is not block-aligned (current vLLM
-  does). DSV4.1 with bounded-replay SWA still replays its window after a load,
-  because LMCache reports only the prefix-cacheable groups as loaded.
+- Sliding-window blocks below the window can be freed while an unfull-chunk
+  store is in flight, the same risk as for full-chunk sliding-window stores.
+- Unfull chunks are not shared over P2P L1; P2P lookup of them is a follow-up
+  for LMCache-native PD.

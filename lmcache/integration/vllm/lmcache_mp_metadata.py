@@ -332,6 +332,7 @@ class LMCacheMPRequestMetadata:
         *,
         save_decode_cache: bool = False,
         prefix_replay_group_ids: Sequence[int] = (),
+        per_request_state_groups: Collection[int] = (),
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -353,6 +354,8 @@ class LMCacheMPRequestMetadata:
                 server skips those windows: DeepSeek V4.1 runs its decoder
                 layers on only the trailing rows of each prefill step, so a
                 window ending inside the prompt holds stale decoder rows.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with every stored chunk.
 
         Returns:
             Metadata for newly storable chunks, or None when no complete
@@ -422,6 +425,8 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
             )
             for group_idx in prefix_replay_group_ids:
                 blocks_per_chunk = (
@@ -467,6 +472,8 @@ class LMCacheMPRequestMetadata:
         tail_grid_tokens: int,
         boundary_state_blocks: Mapping[int, Mapping[int, int]],
         boundary_state_groups: Collection[int],
+        *,
+        per_request_state_groups: Collection[int] = (),
     ) -> list[tuple["LMCacheMPRequestMetadata", list[int]]]:
         """Generate store metadata for the prompt's newly storable unfull chunks.
 
@@ -504,6 +511,8 @@ class LMCacheMPRequestMetadata:
                 ``{boundary token: {engine group: block id}}``.
             boundary_state_groups: Engine groups whose state at a grid
                 boundary must come from ``boundary_state_blocks``.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with the unfull chunk.
 
         Returns:
             One ``(metadata, boundary-state block IDs it reads)`` pair per newly
@@ -559,6 +568,8 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 chunk_start,
                 boundary,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
                 include_unfull_chunk=True,
             )
             if boundary_state_block_ids:
@@ -591,6 +602,8 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        *,
+        per_request_state_groups: Collection[int] = (),
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the retrieve metadata for the current request tracker.
@@ -603,6 +616,8 @@ class LMCacheMPRequestMetadata:
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different
                 values); ``0`` marks a scratch group that is never retrieved.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with every retrieved chunk.
 
         Note:
             A hit that does not end on a chunk boundary ends with the unfull
@@ -633,6 +648,8 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
                 include_unfull_chunk=include_unfull_chunk,
             )
             token_bytes = tracker.packed_token_ids()

@@ -67,4 +67,5 @@ message EngineGroupInfo {
   int64 tp_replicas = 7;
   int64 dcp_shards = 8;
   bool prefix_replay = 9;
+  bool per_request_state = 10;
 }

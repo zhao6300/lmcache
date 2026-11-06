@@ -884,6 +884,21 @@ def trim_and_stage_unfull_chunk_block_ids(
 ) -> tuple[list[torch.Tensor], list[int], list[int]]:
     """Fit an unfull chunk's block id lists to the chunk layout and stage them.
 
+    An unfull chunk covers fewer tokens than a chunk, so each kernel group
+    passes only the blocks of its own token range. Each list is cut to its
+    last ``min(len, keep)`` blocks, where ``keep`` is the group's per-chunk
+    window in blocks (every block for full attention, the last window for a
+    sliding window, one block for recurrent and per-request state). The copy
+    kernel requires exactly ``keep`` blocks per object, so a shorter list is
+    right-aligned: padded at the front with its first block id, and the
+    padding is skipped (``skip_prefix_n_blocks``), never read or written. The
+    real blocks land in the last object slots; store and retrieve fit alike,
+    so block ``i`` maps to the same object offset on both sides.
+
+    When the window of the token after the unfull chunk spans ``keep + 1``
+    blocks, the list also keeps the block before them, the lead block, first.
+    Both sides derive it from ``num_tokens``, so they agree.
+
     Args:
         cache_context: The cache context containing the KV cache information.
         block_ids: One block id list per kernel group, covering only the

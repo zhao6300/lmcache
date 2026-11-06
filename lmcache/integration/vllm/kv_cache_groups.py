@@ -96,14 +96,14 @@ def is_scratch_spec(spec: Any, *, store_replay_windows: bool = False) -> bool:
 
 
 def is_per_request_state_spec(spec: Any) -> bool:
-    """Return whether the spec is a per-request ring.
+    """Return whether the spec is a per-request ring LMCache can transfer.
 
     vLLM's ``CircularBufferSpec`` (``KpoolTailSpec`` on older vLLM) gives each
     request one block for its whole lifetime, written at ``position % capacity``
     and holding the raw keys of the compression group that is still open. It
     is a scratch spec (see :func:`is_scratch_spec`), but unlike the other
-    scratch specs its content is needed to resume a request mid-group, e.g.
-    from an unfull chunk. Checked by class name so this module stays
+    scratch specs its content is needed to resume a request mid-group, e.g. on
+    a prefill-to-decode handoff. Checked by class name so this module stays
     importable without vLLM; ``UniformTypeKVCacheSpecs`` is unwrapped first.
 
     Args:
@@ -389,6 +389,7 @@ def create_engine_group_infos_from_vllm(
     kv_tp_size: int = 1,
     *,
     store_replay_windows: bool = False,
+    include_per_request_state: bool = False,
 ) -> list[EngineGroupInfo]:
     """Build the LMCache engine group infos from vLLM metadata and registered tensors.
 
@@ -417,6 +418,9 @@ def create_engine_group_infos_from_vllm(
         store_replay_windows: Register prefix-replay groups instead of
             excluding them as scratch, flagged ``prefix_replay`` (see
             :func:`is_scratch_spec`).
+        include_per_request_state: Register per-request ring groups (see
+            :func:`is_per_request_state_spec`) as ``per_request_state`` infos
+            instead of excluding them with the other scratch groups.
 
     Note:
         Under DCP each attention group's ``tokens_per_block`` is scaled by
@@ -424,7 +428,8 @@ def create_engine_group_infos_from_vllm(
         to the physical slot count is what sizes each rank's memory object.
         Mamba groups are replicated per rank and stay unscaled. Layers of
         scratch groups (see :func:`is_scratch_spec`) are excluded and never
-        form an info.
+        form an info, except per-request rings when
+        ``include_per_request_state`` is set.
 
     Returns:
         The list of ``EngineGroupInfo`` in protocol order, i.e. the LMCache group
@@ -454,6 +459,9 @@ def create_engine_group_infos_from_vllm(
         else ()
     )
 
+    def is_registered_per_request_state(spec: Any) -> bool:
+        return include_per_request_state and is_per_request_state_spec(spec)
+
     # Scratch groups skip format discovery: their layers are excluded below and
     # never transferred, so a layout the transfer kernels reject must not fail
     # registration.
@@ -463,6 +471,7 @@ def create_engine_group_infos_from_vllm(
         if not is_scratch_spec(
             group.kv_cache_spec, store_replay_windows=store_replay_windows
         )
+        or is_registered_per_request_state(group.kv_cache_spec)
     ]
 
     # CacheBlend fused-aux (presence-gated): the pool joins detection as
@@ -484,6 +493,7 @@ def create_engine_group_infos_from_vllm(
     # Scratch groups (tokens_per_block 0) are excluded the same way.
     per_layer_group_idx: list[int] | None = None
     group_tokens_per_block: dict[int, int] = {}
+    per_request_state_groups: set[int] = set()
     per_layer_sw_size = [-1] * num_layers
     per_layer_recurrent = [False] * num_layers
     per_layer_tp_replicated = [False] * num_layers
@@ -504,7 +514,9 @@ def create_engine_group_infos_from_vllm(
                 dcp_size,
                 store_replay_windows=store_replay_windows,
             )
-            if group_tokens_per_block[engine_group_id] == 0:
+            if is_registered_per_request_state(group.kv_cache_spec):
+                per_request_state_groups.add(engine_group_id)
+            elif group_tokens_per_block[engine_group_id] == 0:
                 continue
             for name in group.layer_names:
                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
@@ -573,6 +585,7 @@ def create_engine_group_infos_from_vllm(
                 # DCP splits a replicated group's tokens across its replicas.
                 dcp_shards=dcp_size if replicated else 1,
                 prefix_replay=identity.engine_group_idx in replay_engine_groups,
+                per_request_state=identity.engine_group_idx in per_request_state_groups,
             )
         )
     return infos
