@@ -228,12 +228,17 @@ void multi_layer_block_kv_transfer(
               head_bytes, ") must be divisible by 2 for vectorized access");
 
   if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
-    // Blocked-scale indexer cache: the per-token fp32 scale must be a whole
-    // number of transfer units, so pin 4-byte units regardless of row width.
+    // Blocked-scale records: the per-token scale is one transfer word, so
+    // the word is the widest of 8/4 bytes dividing the row (584-byte V4
+    // records carry 8 B of UE8M0 scales, 132/68-byte indexer rows an fp32).
     TORCH_CHECK(head_bytes % sizeof(uint32_t) == 0,
                 "NL_X_NB_BSV_BSS row bytes (", head_bytes,
                 ") must be divisible by 4");
-    LAUNCH_TEMPLATED(uint32_t);
+    if (head_bytes % sizeof(uint64_t) == 0) {
+      LAUNCH_TEMPLATED(uint64_t);
+    } else {
+      LAUNCH_TEMPLATED(uint32_t);
+    }
     return;
   }
 
