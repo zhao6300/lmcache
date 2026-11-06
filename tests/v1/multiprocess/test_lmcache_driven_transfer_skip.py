@@ -441,8 +441,12 @@ def _unfull_key(**kwargs):
 
 
 def _make_unfull_store_module(monkeypatch, obj_keys):
+    """``obj_keys`` lists each object group's keys, its unfull chunk's last."""
     module, context, _reads, _transfers = _make_checkpoint_module(monkeypatch)
-    module.context.resolve_obj_keys.return_value = obj_keys
+    module.context.resolve_obj_keys.return_value = [keys[:-1] for keys in obj_keys]
+    module.context.resolve_unfull_chunk_obj_keys.return_value = [
+        keys[-1] for keys in obj_keys
+    ]
     reserved: list[tuple[list, bool]] = []
 
     def reserve_write(keys, layout, is_temporary=False):
@@ -507,11 +511,12 @@ def test_retrieve_of_only_an_unfull_chunk_skips_aux_groups(monkeypatch):
         num_chunks_in_sw=[1, -1, -1],
         group_kinds=("recurrent", "attention", "aux"),
     )
-    module.context.resolve_obj_keys.return_value = [["g0u"], ["g1u"], ["g2u"]]
+    module.context.resolve_obj_keys.return_value = [[], [], []]
+    module.context.resolve_unfull_chunk_obj_keys.return_value = ["g0u", "g1u", "g2u"]
     monkeypatch.setattr(
         mod,
         "trim_and_stage_unfull_chunk_block_ids",
-        lambda cc, b, num_tokens: (b, [0] * len(b), [0] * len(b)),
+        lambda cc, b, num_tokens, skip_tokens: (b, [0] * len(b), [0] * len(b)),
     )
     unfull_transfers: list[int] = []
     monkeypatch.setattr(

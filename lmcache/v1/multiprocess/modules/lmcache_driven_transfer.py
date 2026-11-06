@@ -43,7 +43,6 @@ from lmcache.v1.multiprocess.native_completion import (
 from lmcache.v1.multiprocess.object_group_transfer import (
     downsample_and_stage_block_ids,
     get_unfull_chunk_layout_desc,
-    has_unfull_chunk_lead_block,
     split_unfull_chunk_block_ids,
     transfer_unfull_chunk,
     trim_and_stage_unfull_chunk_block_ids,
@@ -527,7 +526,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             for gid in range(num_object_groups)
         }
-        unfull_group_layout_descs = {
+        group_unfull_chunk_layout_descs = {
             gid: get_unfull_chunk_layout_desc(cache_context, gid)
             for gid in range(num_object_groups)
         }
@@ -538,7 +537,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             layout_desc,
             attn_desc,
             group_layout_descs=group_layout_descs,
-            unfull_group_layout_descs=unfull_group_layout_descs,
+            group_unfull_chunk_layout_descs=group_unfull_chunk_layout_descs,
         )
 
         with self._lock:
@@ -668,7 +667,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             key, list(range(num_object_groups))
         )
         unfull_obj_keys = (
-            [keys.pop() for keys in obj_keys_per_obj_group]
+            self._ctx.resolve_unfull_chunk_obj_keys(key, list(range(num_object_groups)))
             if key.has_unfull_chunk(self._ctx.chunk_size)
             else []
         )
@@ -979,7 +978,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             A key addressing an unfull chunk (``key.has_unfull_chunk``) also
             retrieves that chunk, which the lookup read-locked, in the same
             transaction; its block IDs follow the full chunks' in every group.
-            ``skip_first_n_tokens`` applies to the full chunks only.
+            ``skip_first_n_tokens`` counts from ``key.start``, so it reaches
+            the unfull chunk only when the range has no full chunk (the
+            engine's prefix cache already holds part of the unfull chunk).
         """
         st = time.perf_counter()
 
@@ -1015,7 +1016,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             key, list(range(num_object_groups))
         )
         unfull_obj_keys = (
-            [keys.pop() for keys in obj_keys_per_obj_group]
+            self._ctx.resolve_unfull_chunk_obj_keys(key, list(range(num_object_groups)))
             if key.has_unfull_chunk(self._ctx.chunk_size)
             else []
         )
@@ -1148,7 +1149,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
                     # Only an unfull chunk: no full chunk to read.
-                    if not in_window_keys and unfull_obj_keys:
+                    if unfull_obj_keys and (not in_window_keys):
                         continue
                     found_keys, window_objs = self._ctx.storage_manager.unsafe_read(
                         in_window_keys, l1_owners=read_owners
@@ -1183,6 +1184,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                             if group not in skipped_groups
                         ],
                         unfull_block_ids,
+                        max(0, skip_first_n_tokens - num_chunks * self._ctx.chunk_size),
                     )
                     prefetched_keys.extend(unfull_retained_keys)
             except Exception:
@@ -1311,8 +1313,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         event was waited on. The objects are temporary when
         ``key.request_configs`` sets ``lmcache.temporary_unfull_chunk``. An
         object group whose blocks are all null (no real state) stores nothing.
-        Neither does a model with window lead blocks on a GDS-backed L1: those
-        objects stage through a buffer GDS has not registered.
 
         Args:
             cache_context: The worker's cache context.
@@ -1327,11 +1327,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             ValueError: If a kernel group has no block for the unfull chunk.
         """
         manager = cache_context.kv_layer_groups_manager
-        if self._ctx.storage_manager.has_gds_l1 and any(
-            has_unfull_chunk_lead_block(cache_context, kernel_group_id)
-            for kernel_group_id in range(manager.num_kernel_groups)
-        ):
-            return {}
         block_ids_gpu, skip_blocks, lead_blocks = trim_and_stage_unfull_chunk_block_ids(
             cache_context, block_ids, key.end % self._ctx.chunk_size
         )
@@ -1378,6 +1373,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         obj_keys: list[ObjectKey],
         obj_group_ids: list[int],
         block_ids: list[list[int]],
+        skip_first_n_tokens: int,
     ) -> int:
         """Copy an unfull chunk's read-locked objects into the GPU blocks.
 
@@ -1391,6 +1387,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 ``obj_group_ids``.
             obj_group_ids: The object groups to retrieve.
             block_ids: The unfull chunk's block IDs per kernel group.
+            skip_first_n_tokens: Leading tokens of the unfull chunk not to
+                write: the engine's prefix cache holds them in shared blocks.
 
         Returns:
             The bytes copied.
@@ -1400,7 +1398,10 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 for the unfull chunk.
         """
         block_ids_gpu, skip_blocks, lead_blocks = trim_and_stage_unfull_chunk_block_ids(
-            cache_context, block_ids, key.end % self._ctx.chunk_size
+            cache_context,
+            block_ids,
+            key.end % self._ctx.chunk_size,
+            skip_first_n_tokens,
         )
         found_keys, memory_objs = self._ctx.storage_manager.unsafe_read(
             obj_keys, l1_owners=self._ctx.get_read_owners(key.request_id)

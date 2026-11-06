@@ -653,6 +653,30 @@ class StorageManager:
         for _adapter_id, _desc, adapter in self._snapshot_adapters():
             adapter.submit_touch(keys)
 
+    def contains_l1_keys(self, keys: list[ObjectKey]) -> bool:
+        """Return whether every key is resident in some L1, without locking.
+
+        Args:
+            keys: The object keys to check.
+
+        Returns:
+            True when each key is readable in at least one L1.
+
+        Note:
+            The answer can be stale as soon as this returns; a caller that
+            needs the objects must still read-lock them (e.g. with an L1-only
+            prefetch).
+        """
+        resident = [False] * len(keys)
+        for manager in self._l1_managers_by_id.values():
+            resident = [
+                found or in_l1
+                for found, in_l1 in zip(
+                    resident, manager.contains_keys(keys), strict=True
+                )
+            ]
+        return all(resident)
+
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
     ) -> tuple[int, int]:
@@ -1294,15 +1318,6 @@ class StorageManager:
         ``L1[tag]`` device-owner names; reads without owners still resolve.
         """
         return len(self._l1_managers) > 1
-
-    @property
-    def has_gds_l1(self) -> bool:
-        """Whether any L1 is GDS-backed, so its objects move only through
-        GDS-registered staging buffers."""
-        return any(
-            manager.config.gds_l1_config is not None
-            for manager in self._l1_managers_by_id.values()
-        )
 
     def report_status(self) -> dict:
         """Return per-L1 status and aggregate health; retain single-L1 field names."""
