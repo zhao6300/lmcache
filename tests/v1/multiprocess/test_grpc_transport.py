@@ -1049,3 +1049,57 @@ def test_client_reports_a_zmq_server_instead_of_waiting() -> None:
     finally:
         client.close()
         router.close(linger=0)
+
+
+def test_blend_rope_windows_and_block_groups_round_trip_the_proto() -> None:
+    """3-element view windows ([offset, width, scalar]) and ragged per-group
+    block tables (HMA / compressed groups) survive the gRPC codec."""
+    registry = get_method_codec_registry()
+    rope = registry.by_full_name["lmcache.mp.BlendService.CbRegisterRope"]
+    group_rot = [[], [224, 64, 15], [0, 64]]
+    decoded = rope.request_decoder(
+        rope.request_encoder(
+            (),
+            {
+                "instance_id": 7,
+                "cos_sin_caches_ipc": [],
+                "head_size": 512,
+                "is_neox_style": False,
+                "group_to_cache": [0, 0, 1],
+                "group_rot": group_rot,
+                "group_head_size": [512, 584, 512],
+                "kv_quant": "",
+            },
+        )
+    )
+    assert list(decoded[4]) == [0, 0, 1]
+    assert [list(w) for w in decoded[5]] == group_rot
+    assert list(decoded[6]) == [512, 584, 512]
+
+    retrieve = registry.by_full_name["lmcache.mp.BlendService.CbRetrievePreComputed"]
+    key = IPCCacheServerKey(
+        model_name="model",
+        world_size=1,
+        worker_id=0,
+        token_bytes=pack_token_ids((1, 2, 3)),
+        start=0,
+        end=3,
+        request_id="request",
+        cache_salt="",
+        request_configs={"blend": True},
+    )
+    groups = [[], [5], [2, 1, 235], [], [9, 9]]
+    decoded = retrieve.request_decoder(
+        retrieve.request_encoder(
+            (),
+            {
+                "key": key,
+                "cb_match_result": [CBMatchResult(0, 256, 512, 768, b"h")],
+                "gpu_block_ids": groups,
+                "instance_id": 7,
+                "event_ipc_handle": b"ev",
+            },
+        )
+    )
+    assert [list(g) for g in decoded[2]] == groups
+    assert decoded[1] == [CBMatchResult(0, 256, 512, 768, b"h")]
