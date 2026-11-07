@@ -28,7 +28,7 @@ nvtx
 opentelemetry-api >= 1.43.0, <= 1.45.1
 opentelemetry-sdk >= 1.43.0, <= 1.45.1
 opentelemetry-exporter-otlp >= 1.43.0, <= 1.45.1
-opentelemetry-exporter-prometheus >= 0.64b0, <= 0.66b1
+opentelemetry-exporter-prometheus <= 0.66b2, >= 0.66b2
 prometheus_client >= 0.18.0, <= 0.24.1
 psutil
 py-cpuinfo
