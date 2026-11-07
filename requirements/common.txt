@@ -17,10 +17,18 @@ numpy<=2.2.6; python_version < "3.14"
 numpy; python_version >= "3.14"
 numba
 nvtx
-opentelemetry-api >= 1.20.0, <= 1.40.0
-opentelemetry-sdk >= 1.20.0
-opentelemetry-exporter-otlp >= 1.20.0
-opentelemetry-exporter-prometheus >= 0.50b0, <= 0.61b0
+# The four OpenTelemetry packages version in lockstep: each SDK release pins
+# the matching API exactly, and the Prometheus exporter pairs 0.NNb0 with
+# API 1.(NN-21). The 1.43 floor provides PrometheusMetricReader's
+# ``scope_info_enabled`` switch (otel_init.py turns the default scope labels
+# off so the /metrics exposition keeps its existing label set); 1.45.2 is
+# excluded because it caps each instrument at 2000 distinct attribute sets
+# and folds the rest into an ``otel.metric.overflow`` point, which would
+# silently drop the per-cache_salt series.
+opentelemetry-api >= 1.43.0, <= 1.45.1
+opentelemetry-sdk >= 1.43.0, <= 1.45.1
+opentelemetry-exporter-otlp >= 1.43.0, <= 1.45.1
+opentelemetry-exporter-prometheus >= 0.64b0, <= 0.66b1
 prometheus_client >= 0.18.0, <= 0.24.1
 psutil
 py-cpuinfo

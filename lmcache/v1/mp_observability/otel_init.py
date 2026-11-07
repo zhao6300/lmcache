@@ -132,13 +132,12 @@ def init_otel_metrics(
     else:
         # Prometheus pull fallback — no collector needed
         # Third Party
-        from opentelemetry.exporter.prometheus import PrometheusMetricReader
         import prometheus_client
 
         if prometheus_port is None:
             prometheus_port = 9090
 
-        reader = _with_metrics_sources(PrometheusMetricReader)()
+        reader = _new_prometheus_reader()
         provider = MeterProvider(
             metric_readers=[reader], resource=resource, views=views
         )
@@ -206,6 +205,24 @@ def register_metrics_source(
             _METRICS_SOURCES.remove(source)
 
     return unregister
+
+
+def _new_prometheus_reader() -> "MetricReader":
+    """Create the Prometheus pull reader for the fallback metrics mode.
+
+    ``PrometheusMetricReader`` >= 0.64b0 tags every series with
+    ``otel_scope_*`` labels by default. Every metric name here comes from a
+    single scope, so those labels carry no information and would only change
+    the label set that existing dashboards scrape.
+
+    Returns:
+        A reader that also exports metrics registered through
+        :func:`register_metrics_source`.
+    """
+    # Third Party
+    from opentelemetry.exporter.prometheus import PrometheusMetricReader
+
+    return _with_metrics_sources(PrometheusMetricReader)(scope_info_enabled=False)
 
 
 def _with_metrics_sources(reader_class: type["MetricReader"]) -> type["MetricReader"]:
