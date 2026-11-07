@@ -281,6 +281,7 @@ def slice_block_ids_per_group(
             sliced.append(list(group_block_ids[:1]) * num_chunks)
             continue
         if tokens_per_block == 0:
+            # Scratch group: covers no tokens, so it slices to an empty list.
             sliced.append([])
             continue
         if start_token_idx % tokens_per_block != 0 or (
