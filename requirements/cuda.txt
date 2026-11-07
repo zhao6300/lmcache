@@ -9,7 +9,7 @@
 -r nixl.txt
 
 # Dependencies for NVIDIA GPUs
-ray >= 2.9
+ray >= 2.60.0
 nvidia-ml-py # for pynvml package
 
 
