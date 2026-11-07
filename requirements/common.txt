@@ -42,7 +42,13 @@ grpcio-observability==1.78.0; platform_system == "Linux"
 protobuf>=6.31.1,<7
 redis
 safetensors
-setuptools>=77.0.3,<81.0.0
+# Only the floor is required: setuptools 77 adds the PEP 639 license
+# metadata used by pyproject.toml. There is no known incompatibility above
+# it -- the previous <81 cap came from a dependabot bump, not a breakage.
+# setup.py only uses stable APIs, and setuptools 82 dropping pkg_resources
+# does not affect the build because grpc_tools uses importlib.resources on
+# Python >= 3.9.
+setuptools>=77.0.3
 setuptools_scm>=8
 sortedcontainers
 # 1. avoid pinning torch version in the runtime dependencies so that 
