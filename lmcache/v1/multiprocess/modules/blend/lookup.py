@@ -133,10 +133,7 @@ class LookupMixin:
         """
         align = 1
         for entry in self._transfer_module.context_entries_snapshot().values():
-            if (
-                entry.model_name != key.model_name
-                or entry.world_size != key.world_size
-            ):
+            if entry.model_name != key.model_name or entry.world_size != key.world_size:
                 continue
             for kg in entry.cache_context.kv_layer_groups_manager.kernel_groups:
                 spb = int(getattr(kg, "slots_per_block", 0) or 0)
