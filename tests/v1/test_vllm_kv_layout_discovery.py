@@ -17,6 +17,7 @@ import pytest
 # First Party
 from lmcache.integration.vllm.utils import (
     translate_vllm_kv_cache_layout,
+    try_get_vllm_footer_scale,
     try_get_vllm_kv_cache_layout,
     vllm_layout_hints,
 )
@@ -255,6 +256,26 @@ class TestFooterScaleHint:
         )
 
         assert "blocked_scale" not in vllm_layout_hints(make_vllm_config("LBNHC"))
+
+    def test_missing_vllm_disables_the_hint(self, monkeypatch):
+        """A host without vLLM cannot know the engine's record layout, so the
+        hint stays off instead of failing registration."""
+        monkeypatch.setitem(sys.modules, "vllm", None)
+
+        hints = vllm_layout_hints(make_vllm_config("LBNHC"))
+
+        assert hints == {"kv_layout": "NHD"}
+        assert try_get_vllm_footer_scale() is False
+
+    def test_envs_without_the_cake_flag_is_false(self, monkeypatch):
+        # Third Party
+        import vllm.envs
+
+        monkeypatch.delattr(
+            vllm.envs, "VLLM_FLASHINFER_DSV41_SM120_CAKE", raising=False
+        )
+
+        assert try_get_vllm_footer_scale() is False
 
 
 class TestPackedHeadSlotHintsEdgeCases:
