@@ -700,19 +700,6 @@ class KVLayerGroupsManager:
             "aux" if g.aux else ("recurrent" if g.recurrent else "attention")
             for g in self._object_groups
         )
-        if self._full_sw_kv:
-            # full_sw_kv: attention groups report full attention;
-            # recurrent-state groups keep their window (position-bound
-            # snapshots the blend never touches).
-            return AttnWindowDesc(
-                num_chunks_in_sw=[
-                    (g.sw_size_chunks if g.sw_size_chunks >= 1 else -1)
-                    if g.recurrent
-                    else -1
-                    for g in self._object_groups
-                ],
-                group_kinds=kinds,
-            )
         optional_window = tuple(g.optional_window for g in self._object_groups)
         return AttnWindowDesc(
             num_chunks_in_sw=[

@@ -21,7 +21,6 @@ pytest.importorskip("vllm", reason="group edits import vLLM specs")
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     KVCacheConfig,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 # First Party
@@ -71,6 +70,20 @@ def _kernel_paged(num_states: int, kernel_rows: int, width: int, dtype) -> torch
     return torch.arange(numel).to(dtype).reshape(pages, 1, kernel_rows, width)
 
 
+def _per_layer_group(
+    layer_names: list[str], specs: dict[str, object]
+) -> SimpleNamespace:
+    """A group carrying different specs per layer, on either vLLM interface."""
+    try:
+        # Third Party
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+    except ImportError:
+        # vLLM after RFC #42449 part 2: the group itself maps layer -> spec.
+        return SimpleNamespace(layer_names=layer_names, kv_cache_specs=specs)
+    spec = UniformTypeKVCacheSpecs(block_size=BLOCK_SIZE, kv_cache_specs=specs)
+    return SimpleNamespace(layer_names=layer_names, kv_cache_spec=spec)
+
+
 def _config(groups: list[SimpleNamespace]) -> KVCacheConfig:
     """Config double: the edits read only the groups and the Mamba gate."""
     return cast(
@@ -113,11 +126,10 @@ def test_uniform_group_edits_each_layer_by_its_own_spec():
     mla_raw = _kernel_paged(BLOCK_SIZE, MLA_KERNEL_ROWS, MLA_WIDTH, torch.bfloat16)
     num_states = BLOCK_SIZE // INDEXER_TOKENS_PER_STATE
     idx_raw = _kernel_paged(num_states, INDEXER_KERNEL_ROWS, INDEXER_WIDTH, torch.uint8)
-    spec = UniformTypeKVCacheSpecs(
-        block_size=BLOCK_SIZE,
-        kv_cache_specs={"mla": _mla_spec(), "idx": _indexer_spec()},
+    group = _per_layer_group(
+        ["mla", "idx"], {"mla": _mla_spec(), "idx": _indexer_spec()}
     )
-    config = _config([SimpleNamespace(layer_names=["mla", "idx"], kv_cache_spec=spec)])
+    config = _config([group])
 
     edited = apply_kv_cache_group_edits(
         config, {"mla": mla_raw, "idx": idx_raw}, layout_hints={}
