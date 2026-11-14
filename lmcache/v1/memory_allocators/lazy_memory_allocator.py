@@ -19,7 +19,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.platform import current_device_spec
-from lmcache.v1.system_detection import NUMAMapping
+from lmcache.v1.system_detection import NUMAMapping, bind_memory_to_node
 
 logger = init_logger(__name__)
 
@@ -95,6 +95,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         align_bytes: int = AddressManager.ALIGN_BYTES,
         numa_mapping: NUMAMapping | None = None,
         mlock: bool = False,
+        numa_node: int | None = None,
     ) -> None:
         """
         Args:
@@ -104,6 +105,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
                 Must be a positive power of two. The buffer's base address is
                 aligned to this value, not merely the offsets within it.
             mlock (bool): Lock the whole buffer before any of it is pinned.
+            numa_node (int | None): NUMA node the buffer's pages must come from.
+                Only the policy is set, so pages are still faulted in while
+                the expansion thread pins them and startup stays fast.
+                Takes precedence over ``numa_mapping``.
 
         Raises:
             ValueError: If ``align_bytes`` is not a positive power of two.
@@ -132,7 +137,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         self._pin_record: list[tuple[int, int]] = []
 
         # Detect numa mapping
-        if numa_mapping is not None:
+        if numa_mapping is not None and numa_node is None:
             numa_id = get_numa_id(numa_mapping)
             ptr = device_ops.alloc_numa_ptr(self._final_size, numa_id)
             arr_type = ctypes.c_uint8 * self._final_size
@@ -151,6 +156,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
             offset = (-backing.data_ptr()) % align_bytes
             # Slice shares storage with `backing`; no separate reference needed.
             self._buffer = backing[offset : offset + self._final_size]
+            if numa_node is not None:
+                bind_memory_to_node(
+                    self._buffer.data_ptr(), self._final_size, numa_node
+                )
 
         # Fail loudly here rather than let a misaligned buffer surface as an
         # O_DIRECT EINVAL somewhere downstream.

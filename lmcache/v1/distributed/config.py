@@ -24,6 +24,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
     parse_args_to_l2_adapters_config,
 )
 from lmcache.v1.platform import current_device_spec
+from lmcache.v1.system_detection import get_numa_topology, parse_numa_nodes_spec
 
 logger = init_logger(__name__)
 
@@ -272,6 +273,10 @@ class L1MemoryManagerConfig:
     mlock: bool = False
     """ mlock the L1 buffer so compaction cannot migrate it (ROCm only). """
 
+    numa_node: int | None = None
+    """ NUMA node the L1 pool's pages must come from; ``None`` leaves placement
+    to the kernel. Needs a DRAM pool without shared memory. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
@@ -308,6 +313,15 @@ class L1MemoryManagerConfig:
                 "incompatible with lazy allocation. Please set "
                 "--no-l1-use-lazy when enabling hugepages."
             )
+        if self.numa_node is not None:
+            if self.numa_node < 0:
+                raise ValueError("numa_node must be >= 0")
+            if self.devdax_path:
+                raise ValueError("numa_node cannot be used with l1-devdax-path.")
+            if self.shm_name:
+                raise ValueError(
+                    'numa_node requires SHM to be disabled. Please set --shm-name "".'
+                )
         if self.mlock:
             if current_device_spec.backend_name != "rocm":
                 raise ValueError("l1-mlock is only supported on ROCm.")
@@ -919,6 +933,30 @@ def add_storage_manager_args(
         ),
     )
     memory_group.add_argument(
+        "--l1-numa-aware",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep one L1 pool per NUMA node, sized by --l1-size-gb and "
+            "--l1-numa-nodes. A store goes to the pool of the requesting "
+            "GPU's node and spills to another node's pool only when that "
+            "pool is out of memory, and the thread serving a GPU runs on its "
+            "node's CPUs. Needs DRAM L1 without --shm-name, --l1-manager, "
+            "--l1-devdax-path or --gds-l1-path. Default is False."
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-numa-nodes",
+        type=str,
+        default="auto",
+        help=(
+            "With --l1-numa-aware: 'auto' (every node that has a GPU, even "
+            "split), '0,1' (these nodes, even split) or '0:60,1:40' (these "
+            "nodes with their share of --l1-size-gb in percent, summing to "
+            "100). Default is auto."
+        ),
+    )
+    memory_group.add_argument(
         "--l1-mlock",
         action="store_true",
         help=(
@@ -1090,6 +1128,94 @@ def get_arg_parser() -> argparse.ArgumentParser:
     return add_storage_manager_args(parser)
 
 
+def _split_aligned(total: int, fractions: list[float], align: int) -> list[int]:
+    """Split ``total`` bytes by ``fractions``, each part a multiple of ``align``.
+
+    The rounding remainder goes to the first part, so the parts sum to the
+    total rounded down to ``align``.
+    """
+    parts = [int(total * fraction) // align * align for fraction in fractions]
+    parts[0] += total // align * align - sum(parts)
+    return parts
+
+
+def _parse_numa_aware_config(
+    args: argparse.Namespace, defaults: EvictionConfig
+) -> StorageManagerConfig:
+    """Build one DRAM L1 per NUMA node from the legacy L1 flags.
+
+    Args:
+        args: Parsed arguments with ``--l1-numa-aware`` set.
+        defaults: The eviction settings every L1 inherits.
+
+    Returns:
+        A configuration with one L1 per node and the ``numa`` write policy.
+
+    Raises:
+        ValueError: ``--l1-numa-nodes`` is invalid, a node's share is smaller
+            than ``--l1-align-bytes``, or the L1 flags cannot be used with
+            NUMA-aware L1.
+    """
+    if args.gds_l1_path is not None or args.l1_devdax_path is not None:
+        raise ValueError(
+            "--l1-numa-aware needs DRAM L1: do not set --gds-l1-path or "
+            "--l1-devdax-path"
+        )
+    if getattr(args, "shm_name", None):
+        raise ValueError(
+            "--l1-numa-aware cannot be used with --shm-name: a shared-memory "
+            "pool cannot be bound to a NUMA node"
+        )
+    topology = get_numa_topology()
+    nodes = parse_numa_nodes_spec(args.l1_numa_nodes, topology)
+    fractions = [fraction for _, fraction in nodes]
+    use_hugepages = getattr(args, "l1_use_hugepages", False)
+    use_lazy = args.l1_use_lazy and not use_hugepages
+    sizes = _split_aligned(
+        int(args.l1_size_gb * (1 << 30)), fractions, args.l1_align_bytes
+    )
+    init_sizes = _split_aligned(
+        int(args.l1_init_size_gb * (1 << 30)), fractions, args.l1_align_bytes
+    )
+    l1_configs: list[L1ManagerConfig] = []
+    for (node, _), size, init_size in zip(nodes, sizes, init_sizes, strict=True):
+        if size < args.l1_align_bytes:
+            raise ValueError(
+                f"NUMA node {node} would get {size} bytes of L1; raise "
+                "--l1-size-gb or its share in --l1-numa-nodes"
+            )
+        if use_hugepages:
+            _check_hugepage_availability(size)
+        l1_configs.append(
+            L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=size,
+                    use_lazy=use_lazy,
+                    init_size_in_bytes=init_size,
+                    align_bytes=args.l1_align_bytes,
+                    shm_name="",
+                    use_hugepages=use_hugepages,
+                    mlock=args.l1_mlock,
+                    numa_node=node,
+                ),
+                write_ttl_seconds=args.l1_write_ttl_seconds,
+                read_ttl_seconds=args.l1_read_ttl_seconds,
+                tag=f"numa{node}",
+            )
+        )
+    return StorageManagerConfig(
+        l1_manager_config=l1_configs[0],
+        eviction_config=defaults,
+        l1_manager_configs=l1_configs,
+        l2_adapter_config=parse_args_to_l2_adapters_config(args),
+        store_policy=args.l2_store_policy,
+        prefetch_policy=args.l2_prefetch_policy,
+        write_policy="numa",
+        prefetch_inflight_watermark=args.l2_prefetch_inflight_watermark,
+        periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
+    )
+
+
 def parse_args_to_config(
     args: argparse.Namespace,
 ) -> StorageManagerConfig:
@@ -1121,6 +1247,8 @@ def parse_args_to_config(
     )
     raw_configs = getattr(args, "l1_manager", [])
     if raw_configs:
+        if getattr(args, "l1_numa_aware", False):
+            raise ValueError("Use either --l1-manager or --l1-numa-aware")
         if (
             args.l1_size_gb is not None
             or args.gds_l1_path is not None
@@ -1175,6 +1303,8 @@ def parse_args_to_config(
         raise ValueError(
             "Legacy L1 configuration requires --l1-size-gb and --eviction-policy"
         )
+    if getattr(args, "l1_numa_aware", False):
+        return _parse_numa_aware_config(args, defaults)
     shm_name = getattr(args, "shm_name", None)
     use_hugepages = getattr(args, "l1_use_hugepages", False)
 

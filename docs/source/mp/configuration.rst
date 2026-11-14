@@ -423,6 +423,14 @@ single-L1 interface. For placing L1 on CXL-attached memory see
      - ``False``
      - ROCm only. ``mlock`` the DRAM L1 so memory compaction cannot migrate
        it. See *Locked L1 on ROCm* below. ``--l1-manager`` key: ``mlock``.
+   * - ``--l1-numa-aware`` / ``--no-l1-numa-aware``
+     - ``False``
+     - Keep one pinned-DRAM L1 pool per NUMA node instead of one pool. See
+       *NUMA-aware L1* below.
+   * - ``--l1-numa-nodes``
+     - ``auto``
+     - With ``--l1-numa-aware``: ``auto``, a node list such as ``0,1``, or
+       node shares in percent such as ``0:60,1:40``.
 
 .. _mp-devdax-l1:
 
@@ -495,6 +503,46 @@ adapters are unsupported because they need one contiguous L1 region; the
 SHM transfer channel is disabled; GDS L1 and ``--l1-mlock`` cannot be
 combined with it. For a persistent Device-DAX tier use the L2 adapter in
 :doc:`l2_storage/dax`.
+
+.. _mp-numa-l1:
+
+NUMA-aware L1
+~~~~~~~~~~~~~
+
+On a host whose GPUs sit on different NUMA nodes, a single L1 pool puts some
+GPUs a CPU interconnect away from their pages. ``--l1-numa-aware`` splits
+``--l1-size-gb`` into one pool per node, and the GPUs of a node share the
+pool on that node.
+
+- **Placement.** A store from a GPU goes to the pool of that GPU's node. If
+  that pool is out of memory, the store goes to another node's pool, nearest
+  node first, and fails only when every pool is full. Each pool evicts on its
+  own watermark, so a node normally frees space before its neighbors are used.
+  Reads find a block in whichever pool holds it, so a block stored on another
+  node is still readable, at the cost of the remote access.
+- **Threads.** The worker thread that serves a GPU runs on the CPUs of that
+  GPU's node. It follows the GPU of the request it is serving, so a worker
+  shared by GPUs on different nodes moves with each request.
+- **Nodes and sizes.** ``--l1-numa-nodes auto`` (the default) uses every node
+  that has a GPU and splits evenly. ``0,1`` names the nodes and splits evenly.
+  ``0:60,1:40`` gives each node its share in percent; every node needs a
+  percentage or none does, and they sum to 100. Sizes are rounded down to
+  ``--l1-align-bytes`` and the remainder goes to the first node. Lazy
+  allocation (``--l1-init-size-gb``) is split by the same shares.
+- **Detection.** A GPU's node is read from
+  ``/sys/bus/pci/devices/<bus id>/numa_node``. A GPU whose node is ``-1`` or
+  unreadable is placed in the first pool and does not move its thread.
+
+.. code-block:: bash
+
+   lmcache server --l1-size-gb 400 --eviction-policy LRU \
+       --l1-numa-aware --l1-numa-nodes 0:60,1:40
+
+It needs DRAM L1 without ``--shm-name``, and cannot be combined with
+``--l1-manager``, ``--l1-devdax-path`` or ``--gds-l1-path``. Several pools
+mean no single L1 region, so L2 adapters that need one (P2P, NIXL,
+Mooncake over RDMA) are unsupported. Verify placement on a multi-node host
+with ``numastat -p <server pid>`` or ``/proc/<pid>/numa_maps``.
 
 Locked L1 on ROCm
 -----------------
