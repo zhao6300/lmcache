@@ -150,15 +150,22 @@ def get_group_kv_cache_spec(group: Any) -> Any:
     are shared by every layer of a group, so the first leaf spec represents
     the group.
 
+    A group projected onto a pipeline stage holds only that stage's layers, so
+    it can hold none: vLLM keeps the whole group's specs in ``distinct_specs``
+    for that case, the same on every stage.
+
     Args:
         group: A vLLM ``KVCacheGroup`` (either interface generation).
 
     Returns:
-        The group's representative spec, or ``None`` for an empty group.
+        The group's representative spec, or ``None`` if the group has no spec.
     """
     per_layer = getattr(group, "kv_cache_specs", None)
     if isinstance(per_layer, dict) and per_layer:
         return next(iter(per_layer.values()))
+    distinct = getattr(group, "distinct_specs", None)
+    if distinct:
+        return next(iter(distinct))
     return getattr(group, "kv_cache_spec", None)
 
 

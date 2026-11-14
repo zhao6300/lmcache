@@ -10,6 +10,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    get_group_kv_cache_spec,
     get_tokens_per_block,
     has_prefix_replay,
     is_scratch_spec,
@@ -90,6 +91,17 @@ class MockPerLayerKVCacheGroup:
 
     layer_names: list[str]
     kv_cache_specs: "dict[str, object]"
+    enable_kv_transfer: bool = True
+
+
+@dataclass
+class MockProjectedKVCacheGroup:
+    """A vLLM group projected onto a pipeline stage: only the stage's layers in
+    ``kv_cache_specs``, the whole group's specs in ``distinct_specs``."""
+
+    layer_names: list[str]
+    kv_cache_specs: "dict[str, object]"
+    distinct_specs: "tuple[object, ...]"
     enable_kv_transfer: bool = True
 
 
@@ -937,3 +949,83 @@ def test_conversion_registers_prefix_replay_groups_only_when_stored(
 
     assert [group.prefix_replay for group in spec] == prefix_replay
     assert [group.sw_size_tokens for group in spec] == sw_size_tokens
+
+
+def test_group_spec_of_a_projected_group_without_layers_is_its_unprojected_spec():
+    """A pipeline stage can hold none of a group's layers (a draft group lives
+    on the last stage only); vLLM keeps the group's specs in distinct_specs."""
+    empty = MockProjectedKVCacheGroup(
+        [], {}, (SlidingWindowSpec(block_size=32, sliding_window=128),)
+    )
+    held = MockProjectedKVCacheGroup(
+        ["layer.0"],
+        {"layer.0": FullAttentionSpec(block_size=64)},
+        (FullAttentionSpec(block_size=64), MockKVCacheSpec(block_size=16)),
+    )
+
+    assert get_group_kv_cache_spec(empty) == SlidingWindowSpec(32, 128)
+    assert get_tokens_per_block(get_group_kv_cache_spec(empty), 1) == 32
+    # A group with layers is still read through them.
+    assert get_group_kv_cache_spec(held) == FullAttentionSpec(block_size=64)
+
+
+def test_conversion_skips_a_group_the_stage_holds_no_layers_of():
+    """Registration on a pipeline stage must not fail on a group with no layers
+    there, and the groups it does hold keep their engine group ids."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockProjectedKVCacheGroup(
+                    ["layer.0", "layer.1"],
+                    {
+                        "layer.0": FullAttentionSpec(block_size=64),
+                        "layer.1": FullAttentionSpec(block_size=64),
+                    },
+                    (FullAttentionSpec(block_size=64),),
+                ),
+                MockProjectedKVCacheGroup(
+                    [], {}, (SlidingWindowSpec(block_size=32, sliding_window=128),)
+                ),
+                MockProjectedKVCacheGroup(
+                    ["layer.2"],
+                    {"layer.2": MockKVCacheSpec(block_size=16)},
+                    (MockKVCacheSpec(block_size=16),),
+                ),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1", "layer.2"]),
+    )
+
+    assert [group.engine_group_id for group in spec] == [0, 2]
+    assert [group.tokens_per_block for group in spec] == [64, 16]
+    assert get_engine_group_indices(spec, 3) == [0, 0, 2]
+
+
+def test_connector_geometry_counts_a_group_the_stage_holds_no_layers_of():
+    """The worker connector sizes every engine group, whatever the stage holds."""
+    pytest.importorskip("vllm")
+    # First Party
+    from lmcache.integration.vllm import lmcache_mp_connector as module
+
+    config = MockKVCacheConfig(
+        kv_cache_groups=[
+            MockProjectedKVCacheGroup(
+                ["layer.0"],
+                {"layer.0": FullAttentionSpec(block_size=64)},
+                (FullAttentionSpec(block_size=64),),
+            ),
+            MockProjectedKVCacheGroup(
+                [], {}, (SlidingWindowSpec(block_size=32, sliding_window=128),)
+            ),
+        ]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+
+    assert module.get_group_tokens_per_block(vllm_config, config) == [64, 32]
+    assert {spec.block_size for spec in module._iter_kv_cache_specs(config)} == {
+        64,
+        32,
+    }

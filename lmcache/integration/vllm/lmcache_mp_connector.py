@@ -348,6 +348,11 @@ def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[An
         if isinstance(per_layer_specs, dict) and per_layer_specs:
             yield from per_layer_specs.values()
             continue
+        # A group projected onto a pipeline stage can hold none of its layers.
+        distinct_specs = getattr(group, "distinct_specs", None)
+        if distinct_specs:
+            yield from distinct_specs
+            continue
         group_spec = getattr(group, "kv_cache_spec", None)
         inner = getattr(group_spec, "kv_cache_specs", None)
         if isinstance(inner, dict) and inner:
