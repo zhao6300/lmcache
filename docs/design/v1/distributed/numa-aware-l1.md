@@ -81,9 +81,21 @@ ordinal of the server's device is never assumed to match the physical index.
   take an explicit node instead of deriving it from `torch_dev.current_device()`
   of the calling thread, because the server thread that creates the pool is not
   a GPU thread.
-- New option `--l1-numa-nodes auto|<list>`. `auto` creates one L1 for every node
-  that has at least one GPU. The total size is split evenly by default.
-  Each manager gets the tag `numa<N>`.
+- New option `--l1-numa-nodes`, which splits the existing total
+  (`--l1-size-gb`) across nodes. Each manager gets the tag `numa<N>`. Accepted
+  forms:
+  - `auto`: one L1 for every node that has at least one GPU, split evenly.
+  - `0,1`: the named nodes, split evenly.
+  - `0:60,1:40`: the named nodes with the share of the total in percent, so
+    nobody has to compute sizes.
+- Share rules: either every node has a percentage or none does; each is above
+  0 and they sum to 100, otherwise the server refuses to start with a message
+  naming the offending value. Per-node sizes are rounded down to
+  `align_bytes`, and the rounding remainder goes to the first node. The lazy
+  allocator's initial size (`init_size_in_bytes`) is split with the same
+  percentages.
+- Example: `--l1-size-gb 400 --l1-numa-nodes 0:60,1:40` gives node 0 240 GB and
+  node 1 160 GB.
 - The existing multi-L1 machinery is reused (`create_l1_managers`, per-manager
   eviction controllers, L1 owners recorded on `finish_write`, tags).
 - Shared memory (`shm_name`) is already disabled when more than one L1 exists
@@ -137,6 +149,9 @@ removes cross-socket cost in the Python and CPU-copy paths. Placing the pages
   chunks it pins after the first one.
 - Behavior when a node has memory but no GPU: `auto` skips it. An explicit list
   may name it and is allowed.
+- A node named in `--l1-numa-nodes` that does not exist, or whose size after
+  the split cannot hold one chunk, should fail at startup, not at the first
+  store.
 
 ## Compatibility
 
@@ -159,7 +174,9 @@ CPU-only tests that can run here:
 - Worker pool: workers of each node run with the expected CPU affinity (the
   real `sched_setaffinity` works on any Linux host when pinned to a CPU
   subset), tasks reach the right group, unmapped keys use the existing path.
-- Config validation and unchanged defaults.
+- Config validation and unchanged defaults, including the percentage forms:
+  even split, `0:60,1:40`, mixed forms rejected, sums other than 100 rejected,
+  and the rounding remainder.
 
 Needs a multi-node machine, not testable in the CI sandbox:
 
