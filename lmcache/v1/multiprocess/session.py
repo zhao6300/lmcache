@@ -50,8 +50,25 @@ class Session:
     lookup_ipc_key: Optional[IPCCacheServerKey] = None
     prefetch_hit_chunks: int = -1
     prefetch_locked_gids: tuple = ()
+    # Lock model of each lookup a later lookup replaced, keyed by its hit
+    # chunks: an extra free range ends at that hit and must release the
+    # groups that lookup locked, which differ when an optional window was
+    # present for one lookup and absent for the other.
+    replaced_locked_gids: dict[int, tuple[int, ...]] = field(default_factory=dict)
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
     extras: dict[str, Any] = field(default_factory=dict)
+    # End token offset of the last range the engine actually looked up, i.e.
+    # the prompt. Set only by ``begin_lookup``; ``lookup_ipc_key`` cannot serve
+    # here because a session that stores before it ever looks up gets that
+    # field filled from a store key, whose range is one 2048-token slice
+    # rather than the whole prefix.
+    lookup_end: int = 0
+    # Furthest token offset this session has resolved object keys for, i.e.
+    # how far its KV actually reached L1. Stores advance it as the answer is
+    # generated, so at ``end_session`` it marks the end of the last full chunk
+    # the request committed to the cache -- the only place a commit may anchor
+    # a window, since nothing past it exists to copy.
+    resolved_end: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_tokens(self, packed_token_ids: bytes) -> None:
@@ -63,6 +80,20 @@ class Session:
         """
         with self._lock:
             self.tokens = packed_token_ids
+
+    def note_resolved(self, end: int) -> None:
+        """Record that object keys were resolved up to ``end``.
+
+        Monotonic: several workers resolve the same request's ranges
+        concurrently and in any order, and a repeated or older range must not
+        pull the mark back.
+
+        Args:
+            end: Token offset just past the resolved range.
+        """
+        with self._lock:
+            if end > self.resolved_end:
+                self.resolved_end = end
 
     @overload
     def get_hashes(self, start: int, end: int) -> list: ...
@@ -196,9 +227,18 @@ class Session:
             self.num_chunks_processed += 1
 
     def begin_lookup(self, key: IPCCacheServerKey) -> None:
-        """Record a new lookup and reset the previous lookup's result."""
+        """Record a new lookup and reset the previous lookup's result.
+
+        The previous lookup's lock model stays in ``replaced_locked_gids``
+        so a later free of its range releases the groups it locked.
+        """
         with self._lock:
+            if self.prefetch_hit_chunks > 0:
+                self.replaced_locked_gids[self.prefetch_hit_chunks] = (
+                    self.prefetch_locked_gids
+                )
             self.lookup_ipc_key = key
+            self.lookup_end = key.end
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
             self._prefetch_owners.clear()

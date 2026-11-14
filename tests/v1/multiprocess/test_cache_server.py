@@ -358,7 +358,7 @@ def registered_instance(
     # Register KV cache. No engine group infos are sent, so the server
     # detects ``slots_per_block`` from the tensors and treats every group
     # as uncompressed (``compress_ratio == 1``).
-    future = client.register_kv_cache(
+    register_future = client.register_kv_cache(
         instance_id,
         client_context.get_kv_cache(),
         "testmodel",
@@ -367,8 +367,8 @@ def registered_instance(
         {},
         [],
     )
-    result = future.result(timeout=DEFAULT_TIMEOUT)
-    assert result is None, "Register should return None"
+    register_result = register_future.result(timeout=DEFAULT_TIMEOUT)
+    assert register_result.succeed
 
     yield instance_id
 
@@ -378,8 +378,8 @@ def registered_instance(
         # retrieve paths can leave completed entries read-locked briefly, and
         # non-force clear intentionally preserves those objects.
         client.clear(force=True).result(timeout=DEFAULT_TIMEOUT)
-        future = client.unregister_kv_cache(instance_id)
-        future.result(timeout=DEFAULT_TIMEOUT)
+        unregister_future = client.unregister_kv_cache(instance_id)
+        unregister_future.result(timeout=DEFAULT_TIMEOUT)
     except Exception as e:
         print(f"Error during unregister: {e}")
 
@@ -406,7 +406,7 @@ def test_register_unregister_kv_cache(
 
     # Register. No engine group infos: geometry is detected from the
     # tensors (uncompressed).
-    future = client.register_kv_cache(
+    register_future = client.register_kv_cache(
         instance_id,
         client_context.get_kv_cache(),
         "testmodel",
@@ -415,13 +415,13 @@ def test_register_unregister_kv_cache(
         {},
         [],
     )
-    result = future.result(timeout=DEFAULT_TIMEOUT)
-    assert result is None
+    register_result = register_future.result(timeout=DEFAULT_TIMEOUT)
+    assert register_result.succeed
 
     # Unregister
-    future = client.unregister_kv_cache(instance_id)
-    result = future.result(timeout=DEFAULT_TIMEOUT)
-    assert result is None
+    unregister_future = client.unregister_kv_cache(instance_id)
+    unregister_result = unregister_future.result(timeout=DEFAULT_TIMEOUT)
+    assert unregister_result is None
 
 
 def test_store_and_lookup(

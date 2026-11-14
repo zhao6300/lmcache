@@ -6,9 +6,10 @@ LMCache can still store / load KV cache correctly.
 
 Currently there are four Mamba-related edits plus the sub-paged attention
 edits (fused tensor, interleaved rank-5 view, contiguous plane, and MLA),
-one per :class:`KVCacheGroupEdit` subclass below. The registry is only
-consulted when
-``kv_cache_config.has_mamba_layers``. :func:`validate_kv_cache_groups`
+one per :class:`KVCacheGroupEdit` subclass below. The ``_EDITS`` registry is
+for Mamba-hybrid models and is only consulted when
+``kv_cache_config.has_mamba_layers``; the per-request ring edit applies to any
+model when rings are registered. :func:`validate_kv_cache_groups`
 additionally rejects, at startup, group specs the transfer path cannot serve
 correctly yet (see its docstring).
 
@@ -47,11 +48,42 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     KVCacheSpecKind,
-    get_kv_cache_spec_kind,
 )
+
+try:
+    # Third Party
+    from vllm.v1.kv_cache_interface import get_kv_cache_spec_kind
+except ImportError:
+    # vLLM builds that classify specs through their manager config (e.g. the
+    # DeepSeek-V4.1 fork) do not export the helper. Classify by spec class so
+    # LMCache can still reject cross-attention and unsupported Mamba modes.
+    def get_kv_cache_spec_kind(spec: KVCacheSpec) -> KVCacheSpecKind:
+        """Return the ``KVCacheSpecKind`` of *spec* by class name."""
+        names = {cls.__name__ for cls in type(spec).__mro__}
+        if "CrossAttentionSpec" in names:
+            return KVCacheSpecKind.CROSS_ATTENTION
+        if "MambaSpec" in names:
+            return KVCacheSpecKind.MAMBA
+        if "SlidingWindowMLASpec" in names:
+            return KVCacheSpecKind.SLIDING_WINDOW_MLA
+        if "SlidingWindowSpec" in names:
+            return KVCacheSpecKind.SLIDING_WINDOW
+        if "ChunkedLocalAttentionSpec" in names:
+            return KVCacheSpecKind.CHUNKED_LOCAL_ATTENTION
+        if "SinkFullAttentionSpec" in names:
+            return KVCacheSpecKind.SINK_FULL_ATTENTION
+        if "MLAAttentionSpec" in names:
+            return KVCacheSpecKind.MLA_ATTENTION
+        return KVCacheSpecKind.FULL_ATTENTION
 import torch
 
 # First Party
+from lmcache.integration.vllm.kv_cache_groups import (
+    get_group_kv_cache_spec,
+    get_layer_kv_cache_spec,
+    is_per_request_state_spec,
+    is_transferable_group,
+)
 from lmcache.logging import init_logger
 from lmcache.v1.common.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
@@ -156,7 +188,14 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
         return
     unsupported: list[str] = []
     for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
-        for spec in _leaf_specs(group.kv_cache_spec):
+        if not is_transferable_group(group):
+            continue
+        per_layer_specs = getattr(group, "kv_cache_specs", None)
+        if isinstance(per_layer_specs, dict) and per_layer_specs:
+            specs = list(per_layer_specs.values())
+        else:
+            specs = _leaf_specs(get_group_kv_cache_spec(group))
+        for spec in specs:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
@@ -1070,6 +1109,66 @@ class _SubpagedAttentionContiguousPlaneViewEdit(KVCacheGroupEdit):
         return [k_plane.view(logical_shape), v_plane.view(logical_shape)]
 
 
+class _PerRequestStateOpaqueViewEdit(KVCacheGroupEdit):
+    """Re-view a per-request ring as one opaque row per block.
+
+    A ring (``CircularBufferSpec``) block is never addressed by token position
+    from LMCache: the request's single block is always copied whole. Its
+    registered layout ``[NB, H, capacity, C]`` may carry padding between the
+    heads (GLM-5.3-Flash's kpool tail), which format discovery rejects, so the
+    block is re-viewed as ``[NB, 1, 1, row]``: one slot and one head whose
+    content is this layer's whole span, padding included.
+    """
+
+    name = "per-request-state-opaque-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        return is_per_request_state_spec(spec) and isinstance(kv_cache, torch.Tensor)
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        _layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        """Re-view each ring block as one row covering this layer's span.
+
+        The span runs from the block base to this layer's last element, so it
+        never reaches a sibling layer sharing the block. It is rounded up to
+        the widest transfer alignment that divides the block step, staying
+        within ``spec.page_size_bytes``.
+
+        Raises:
+            ValueError: If the span cannot be aligned within the page.
+        """
+        assert isinstance(kv_cache, torch.Tensor)
+        elem = kv_cache.element_size()
+        block_step = kv_cache.stride(0)
+        span = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(
+                kv_cache.shape[1:], kv_cache.stride()[1:], strict=True
+            )
+        )
+        row = 0
+        for align_bytes in (16, 8, 4, 2):
+            if align_bytes % elem != 0 or (block_step * elem) % align_bytes != 0:
+                continue
+            step = align_bytes // elem
+            candidate = -(-span // step) * step
+            if candidate * elem <= spec.page_size_bytes:
+                row = candidate
+                break
+        if row == 0:
+            raise ValueError(
+                f"cannot align a {span}-element ring span within the "
+                f"{spec.page_size_bytes}-byte page"
+            )
+        return kv_cache.as_strided(
+            (kv_cache.shape[0], 1, 1, row), (block_step, row, row, 1)
+        )
+
+
 # Rule registry, in match priority order.
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
     _MambaUnifiedViewEdit(),
@@ -1080,25 +1179,32 @@ _EDITS: tuple[KVCacheGroupEdit, ...] = (
     _SubpagedAttentionInterleavedPlaneViewEdit(),
     _SubpagedAttentionContiguousPlaneViewEdit(),
 )
+# Applied for any model (Mamba-hybrid or not) when rings are registered.
+_PER_REQUEST_STATE_EDIT = _PerRequestStateOpaqueViewEdit()
 
 
 def apply_kv_cache_group_edits(
     kv_cache_config: KVCacheConfig | None,
     kv_caches: Mapping[str, RegisteredKVCache],
     layout_hints: LayoutHints,
+    include_per_request_state: bool = False,
 ) -> dict[str, RegisteredKVCache]:
     """Apply all KV cache group metadata edits for LMCache registration.
 
     Each layer is checked against the ``_EDITS`` rules (first match wins) and
     re-viewed by the matching rule; layers matching no rule pass through
-    unchanged. ``None`` configs and configs without Mamba groups are returned
-    as-is (as a dict): all current rules only apply to Mamba-hybrid models.
+    unchanged. The ``_EDITS`` rules only apply to Mamba-hybrid models, so
+    configs without Mamba groups skip them. Per-request ring layers are
+    re-viewed separately, for any model, when ``include_per_request_state``
+    is set.
 
     Args:
         kv_cache_config: vLLM ``KVCacheConfig`` (read for per-group specs).
         kv_caches: Registered tensors keyed by layer name. Mamba entries are
             ``[conv_state, ssm_state]`` lists; others are single tensors.
         layout_hints: layout hints from vLLM (see :class:`LayoutHints`).
+        include_per_request_state: Re-view per-request ring layers (see
+            ``is_per_request_state_spec``) for registration.
 
     Returns:
         A new ``dict`` with edited layers re-viewed, others untouched.
@@ -1110,16 +1216,24 @@ def apply_kv_cache_group_edits(
     """
     # Backstop for connectors initialized without a kv_cache_config.
     validate_kv_cache_groups(kv_cache_config)
-    if kv_cache_config is None or not kv_cache_config.has_mamba_layers:
+    if kv_cache_config is None:
+        return dict(kv_caches)
+    edits: tuple[KVCacheGroupEdit, ...] = (
+        _EDITS if kv_cache_config.has_mamba_layers else ()
+    )
+    if include_per_request_state:
+        edits = (_PER_REQUEST_STATE_EDIT, *edits)
+    if not edits:
         return dict(kv_caches)
 
     edited = dict(kv_caches)
     counts: Counter[str] = Counter()
     for group in kv_cache_config.kv_cache_groups:
-        per_layer_specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+        if not is_transferable_group(group):
+            continue
         for name in group.layer_names:
-            spec = per_layer_specs[name] if per_layer_specs else group.kv_cache_spec
-            for edit in _EDITS:
+            spec = get_layer_kv_cache_spec(group, name)
+            for edit in edits:
                 if edit.matches(spec, kv_caches[name]):
                     edited[name] = edit.apply(spec, kv_caches[name], layout_hints)
                     counts[edit.name] += 1

@@ -271,7 +271,6 @@ def test_init_observability_propagates_grpc_metrics_enabled(monkeypatch):
 
 def test_metrics_sources_are_exported_with_sdk_metrics(monkeypatch):
     # Third Party
-    from opentelemetry.exporter.prometheus import PrometheusMetricReader
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import (
         AggregationTemporality,
@@ -280,8 +279,9 @@ def test_metrics_sources_are_exported_with_sdk_metrics(monkeypatch):
         Sum,
     )
     from prometheus_client import REGISTRY, generate_latest
+    from prometheus_client.parser import text_string_to_metric_families
 
-    reader = otel_init._with_metrics_sources(PrometheusMetricReader)()
+    reader = otel_init._new_prometheus_reader()
     provider = MeterProvider(metric_readers=[reader])
     provider.get_meter("sdk").create_counter("sdk.calls").add(1)
 
@@ -319,6 +319,11 @@ def test_metrics_sources_are_exported_with_sdk_metrics(monkeypatch):
         unregister()
         provider.shutdown()
 
-    assert 'native_calls_total{kind="native"} 7.0' in text
-    assert "sdk_calls_total" in text
+    families = {f.name: f for f in text_string_to_metric_families(text)}
+    # Exactly one series carrying only the source's own label: the reader must
+    # not add instrumentation-scope labels to the exposition.
+    assert [(dict(s.labels), s.value) for s in families["native_calls"].samples] == [
+        ({"kind": "native"}, 7.0)
+    ]
+    assert "sdk_calls" in families
     assert otel_init._METRICS_SOURCES == [broken]

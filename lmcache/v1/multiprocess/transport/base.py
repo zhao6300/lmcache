@@ -7,6 +7,7 @@ from typing import Protocol
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.common.custom_types import (
+    NO_SESSION_END_INFO,
     BlockAllocationRecord,
     CBMatchResult,
     CBUnifiedLookupResult,
@@ -16,6 +17,8 @@ from lmcache.v1.common.custom_types import (
     PrepareStoreResponse,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
+    RegisterKVCacheResponse,
+    SessionEndInfo,
 )
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.kv_format.types import LayoutHints
@@ -56,7 +59,7 @@ class RequestClient(Protocol):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
-    ) -> MessagingFuture[None]: ...
+    ) -> MessagingFuture[RegisterKVCacheResponse]: ...
 
     @rpc_method
     def unregister_kv_cache(self, instance_id: int) -> MessagingFuture[None]: ...
@@ -150,6 +153,9 @@ class RequestClient(Protocol):
     ) -> MessagingFuture[int | None]: ...
 
     @rpc_method
+    def query_lookup_window(self, request_id: str) -> MessagingFuture[bool]: ...
+
+    @rpc_method
     def free_lookup_locks(
         self,
         key: IPCCacheServerKey,
@@ -158,7 +164,11 @@ class RequestClient(Protocol):
     ) -> MessagingFuture[None]: ...
 
     @rpc_method
-    def end_session(self, request_id: str) -> MessagingFuture[None]: ...
+    def end_session(
+        self,
+        request_id: str,
+        end_info: SessionEndInfo = NO_SESSION_END_INFO,
+    ) -> MessagingFuture[None]: ...
 
     @rpc_method
     def register_kv_cache_engine_driven_context(

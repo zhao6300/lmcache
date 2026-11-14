@@ -14,6 +14,8 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.common.attn_window import AttnWindowDesc
+from lmcache.v1.multiprocess.custom_types import RegisterKVCacheResponse
 from lmcache.v1.transport.futures import DeviceMessagingFuture, MessagingFuture
 
 
@@ -130,7 +132,7 @@ def test_worker_exports_events_through_platform_backend(
     )
 
     client = MagicMock()
-    client.register_kv_cache.return_value = _resolved_future(True)
+    client.register_kv_cache.return_value = _resolved_future(RegisterKVCacheResponse())
     client.store.return_value = MessagingFuture()
     client.retrieve.return_value = MessagingFuture()
 
@@ -184,6 +186,42 @@ def test_worker_exports_events_through_platform_backend(
     assert backend.calls[0][1] == device
     assert backend.calls[1][1] == device
     assert all(call[-1] == device for call in backend.calls[3:])
+
+
+def test_worker_surfaces_registration_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server registration rejection reaches the worker as a ValueError."""
+    # First Party
+    from lmcache.v1.client import worker_transfer
+
+    backend = _FakeEventBackend()
+    monkeypatch.setattr(
+        worker_transfer, "get_event_ipc_backend", lambda device: backend
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "wrap_kv_caches",
+        lambda kv_caches: list(kv_caches.values()),
+    )
+    # The bare tensors above carry no out-of-band fds; fd delivery is covered by
+    # the export test and would call ``fd_payload`` on them.
+    monkeypatch.setattr(
+        worker_transfer,
+        "kv_wrapper_fds_delivered",
+        lambda wrappers, fd_channel_path, timeout: nullcontext(),
+    )
+    client = MagicMock()
+    client.register_kv_cache.return_value = _resolved_future(
+        RegisterKVCacheResponse(
+            succeed=False,
+            error_message="restart with --separate-object-groups",
+        )
+    )
+    context = worker_transfer.LMCacheDrivenTransferContext(1, client)
+
+    with pytest.raises(ValueError, match="--separate-object-groups"):
+        context.register({"layer_0": torch.empty(1)}, "model", 1, 1, 1.0)
 
 
 def test_server_store_and_retrieve_delegate_event_ordering(
@@ -269,9 +307,7 @@ def test_server_store_and_retrieve_delegate_event_ordering(
             num_object_groups=1,
             num_kernel_groups=1,
             object_groups=[SimpleNamespace(kernel_group_indices=[0])],
-            get_attn_desc=lambda: SimpleNamespace(
-                num_chunks_in_sw=[-1], group_kinds=()
-            ),
+            get_attn_desc=lambda: AttnWindowDesc(num_chunks_in_sw=[-1]),
         ),
         calculate_num_blocks=lambda chunk_size, group_idx: 1,
         transfer_object_group=lambda *args, **kwargs: None,

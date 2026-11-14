@@ -20,8 +20,16 @@ from lmcache.v1.distributed.api import (
     ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.config import StorageManagerConfig
+from lmcache.v1.distributed.object_group_classifier import ObjectGroupClassifier
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
+from lmcache.v1.multiprocess.commit_policy import (
+    DEFAULT_COMMIT_CONFIG,
+    CommitPolicy,
+    CommitPolicyConfig,
+    create_commit_policy,
+)
+from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.session import SessionManager
 
 logger = init_logger(__name__)
@@ -34,23 +42,88 @@ class ShmPoolInfo(TypedDict):
     pool_size: int
 
 
+@dataclass(frozen=True)
+class _Registration:
+    """One active KV cache registration of a ``(model_name, world_size)``."""
+
+    worker_id: int | None
+    """The registering worker's id, or ``None`` when the registration does
+    not carry one."""
+    layout_desc: MemoryLayoutDesc
+    attn_desc: AttnWindowDesc
+    group_layout_descs: dict[int, MemoryLayoutDesc]
+    group_unfull_chunk_layout_descs: dict[int, MemoryLayoutDesc] | None
+    shard_replication_desc: ShardReplicationDesc
+
+
 @dataclass
 class _LayoutDescEntry:
-    """Stored layout descriptor and its active registration count."""
+    """A pair's active registrations and the descriptors lookups use."""
 
+    registrations: list[_Registration]
+    """Active registrations, oldest first."""
     layout_desc: MemoryLayoutDesc
-    ref_count: int
-    attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
+    attn_desc: AttnWindowDesc
     """Cross-chunk attention windows of all object groups, in object-group
-    order. Defaults to a single full-attention group."""
-    group_layout_descs: dict[int, MemoryLayoutDesc] | None = None
-    """Per-group layout descriptors, or ``None`` if all share ``layout_desc``."""
-    group_unfull_chunk_layout_descs: dict[int, MemoryLayoutDesc] | None = None
+    order."""
+    group_layout_descs: dict[int, MemoryLayoutDesc]
+    """Per-group layout descriptors."""
+    group_unfull_chunk_layout_descs: dict[int, MemoryLayoutDesc] | None
     """Per-group layouts of unfull-chunk objects, or ``None`` if they match
     ``group_layout_descs``."""
-    shard_replication_desc: ShardReplicationDesc = DEFAULT_SHARD_REPLICATION_DESC
-    """How each object group is spread over the kv ranks; the default stores
-    every group per rank."""
+    shard_replication_desc: ShardReplicationDesc
+    """How each object group is spread over the kv ranks."""
+
+
+def _merge_registrations(registrations: list[_Registration]) -> _LayoutDescEntry:
+    """Combine a pair's active registrations into the descriptors lookups use.
+
+    A pipeline stage registers only the object groups of its own layers, so
+    the registration with the most groups (the latest among ties) describes
+    them all; a group id means the same KV on every stage that registers it.
+    A group that not every registering worker stores is restricted to the
+    workers that do (:meth:`ShardReplicationDesc.storing_workers`).
+
+    Args:
+        registrations: The pair's active registrations, oldest first; not
+            empty.
+
+    Returns:
+        The pair's entry.
+    """
+    base = max(reversed(registrations), key=lambda r: r.attn_desc.num_object_groups)
+    num_groups = base.attn_desc.num_object_groups
+    registered = {r.worker_id for r in registrations}
+    storing_workers: list[frozenset[int] | None] = []
+    for group in range(num_groups):
+        owners = {
+            r.worker_id for r in registrations if group < r.attn_desc.num_object_groups
+        }
+        # A registration without a worker id may be any worker.
+        if owners == registered or None in owners:
+            storing_workers.append(None)
+        else:
+            storing_workers.append(frozenset(w for w in owners if w is not None))
+
+    shard_replication_desc = base.shard_replication_desc
+    if any(workers is not None for workers in storing_workers):
+        shard_replication_desc = ShardReplicationDesc(
+            group_tp_replicas=tuple(
+                shard_replication_desc.tp_replicas(g) for g in range(num_groups)
+            ),
+            group_dcp_shards=tuple(
+                shard_replication_desc.dcp_shards(g) for g in range(num_groups)
+            ),
+            group_storing_workers=tuple(storing_workers),
+        )
+    return _LayoutDescEntry(
+        registrations=registrations,
+        layout_desc=base.layout_desc,
+        attn_desc=base.attn_desc,
+        group_layout_descs=base.group_layout_descs,
+        group_unfull_chunk_layout_descs=base.group_unfull_chunk_layout_descs,
+        shard_replication_desc=shard_replication_desc,
+    )
 
 
 def finish_lookup_read(
@@ -90,12 +163,49 @@ class LayoutDescRegistry:
     for prefetch tasks. Multiple worker instances can share the same
     ``(model_name, world_size)`` entry, so the registry keeps the descriptor
     until the last matching registration is unregistered.
+
+    This registry is also the hook that feeds the storage layer's
+    :class:`ObjectGroupClassifier`: every registration forwards its
+    ``attn_desc`` to the classifier and drops it again on unregistration, so
+    object-group-aware store policies learn the attention layout from the same
+    call that registers the KV cache and the ``distributed`` layer needs no
+    import of ``lmcache.v1.multiprocess``.
+
+    The classifier keys on the model name alone and rejects two incompatible
+    layouts under one name, while this registry keys on
+    ``(model_name, world_size)`` and lets a re-registration replace the
+    windows. A registration the classifier rejects is therefore logged and
+    dropped instead of propagated: the model keeps the layout it was first
+    registered with, or classifies as ``UNKNOWN``, and ``defer_windowed``
+    falls back to writing everything through — the safe direction. The
+    forwarded registrations are counted in ``self._classifier_refs`` so that
+    a rejected one is not unregistered later.
+
+    Thread safety: ``self._lock`` guards ``self._registry`` and
+    ``self._classifier_refs`` and is never held while calling into the
+    classifier (which takes its own lock), so the two locks are never nested.
+
+    Args:
+        object_group_classifier: Classifier to forward attention descriptors
+            to, normally ``StorageManager.object_group_classifier``. Defaults
+            to a private classifier that nothing else reads, which keeps
+            standalone registries (tests, tools) working.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, object_group_classifier: ObjectGroupClassifier | None = None
+    ) -> None:
         # Key: (model_name, world_size) -> layout descriptor entry
         self._registry: dict[tuple[str, int], _LayoutDescEntry] = {}
+        # Key: model_name -> registrations the classifier accepted, so that
+        # only those are unregistered again.
+        self._classifier_refs: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._object_group_classifier = (
+            object_group_classifier
+            if object_group_classifier is not None
+            else ObjectGroupClassifier()
+        )
 
     def register(
         self,
@@ -106,11 +216,15 @@ class LayoutDescRegistry:
         group_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
         group_unfull_chunk_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
         shard_replication_desc: ShardReplicationDesc = DEFAULT_SHARD_REPLICATION_DESC,
+        worker_id: int | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
-        Re-registering the same pair increments the active registration
-        count. The latest descriptor is retained for lookups.
+        Each call adds one active registration of the pair. Lookups use the
+        descriptors of the registration with the most object groups (the
+        latest among ties). When registering workers store different groups,
+        as pipeline stages do, a group is looked up only on the workers that
+        registered it (:meth:`ShardReplicationDesc.storing_workers`).
 
         Args:
             model_name: The model name.
@@ -128,6 +242,10 @@ class LayoutDescRegistry:
             shard_replication_desc: How each object group is spread over the kv ranks.
                 Empty (the default) stores every group per rank; otherwise it
                 describes every object group of ``attn_desc``.
+            worker_id: The registering worker's id within ``world_size`` (the
+                ``worker_id`` its store keys carry), or ``None`` when the
+                registration does not carry one; its groups then count as
+                stored by every worker.
 
         Raises:
             ValueError: If ``shard_replication_desc`` describes a different number of
@@ -148,47 +266,92 @@ class LayoutDescRegistry:
             group_layout_descs = {
                 gid: layout_desc for gid in range(attn_desc.num_object_groups)
             }
+        registration = _Registration(
+            worker_id=worker_id,
+            layout_desc=layout_desc,
+            attn_desc=attn_desc,
+            group_layout_descs=group_layout_descs,
+            group_unfull_chunk_layout_descs=group_unfull_chunk_layout_descs,
+            shard_replication_desc=shard_replication_desc,
+        )
+        self._forward_registration(model_name, attn_desc)
         with self._lock:
             entry = self._registry.get(key)
-            if entry is None:
-                self._registry[key] = _LayoutDescEntry(
-                    layout_desc=layout_desc,
-                    ref_count=1,
-                    attn_desc=attn_desc,
-                    group_layout_descs=group_layout_descs,
-                    group_unfull_chunk_layout_descs=group_unfull_chunk_layout_descs,
-                    shard_replication_desc=shard_replication_desc,
-                )
-                return
+            registrations = [] if entry is None else entry.registrations
+            self._registry[key] = _merge_registrations([*registrations, registration])
 
-            entry.layout_desc = layout_desc
-            entry.attn_desc = attn_desc
-            entry.group_layout_descs = group_layout_descs
-            entry.group_unfull_chunk_layout_descs = group_unfull_chunk_layout_descs
-            entry.shard_replication_desc = shard_replication_desc
-            entry.ref_count += 1
-
-    def unregister(self, model_name: str, world_size: int) -> None:
+    def unregister(
+        self, model_name: str, world_size: int, worker_id: int | None = None
+    ) -> None:
         """Unregister one layout descriptor registration for a pair.
 
+        Removes the most recent registration made with ``worker_id``, if any.
         The descriptor is removed only when the last active registration for
         the pair is unregistered.
 
         Args:
             model_name: The model name.
             world_size: The world size.
+            worker_id: The worker id the registration was made with.
         """
         key = (model_name, world_size)
         with self._lock:
             entry = self._registry.get(key)
             if entry is None:
                 return
-
-            if entry.ref_count <= 1:
-                self._registry.pop(key)
+            registrations = entry.registrations
+            matches = [
+                i for i, r in enumerate(registrations) if r.worker_id == worker_id
+            ]
+            if not matches:
                 return
+            remaining = registrations[: matches[-1]] + registrations[matches[-1] + 1 :]
+            if not remaining:
+                self._registry.pop(key)
+            else:
+                self._registry[key] = _merge_registrations(remaining)
 
-            entry.ref_count -= 1
+            classifier_refs = self._classifier_refs.get(model_name, 0)
+            if classifier_refs <= 1:
+                self._classifier_refs.pop(model_name, None)
+            else:
+                self._classifier_refs[model_name] = classifier_refs - 1
+
+        # Mirror the drop in the classifier, which reference counts per model
+        # name across world sizes.
+        if classifier_refs > 0:
+            self._object_group_classifier.unregister(model_name)
+
+    def _forward_registration(self, model_name: str, attn_desc: AttnWindowDesc) -> None:
+        """Push one attention layout into the object-group classifier.
+
+        A layout the classifier refuses (another layout is already registered
+        under the same model name) is logged and dropped rather than raised:
+        this registry allows a re-registration to replace the windows, and a
+        failed KV-cache registration would be far worse than a model that
+        classifies conservatively.
+
+        Args:
+            model_name: The model name.
+            attn_desc: The attention-window descriptor to forward.
+        """
+        try:
+            self._object_group_classifier.register(model_name, attn_desc)
+        except ValueError:
+            logger.error(
+                "Attention layout %s registered for model %r conflicts with "
+                "the layout already registered under that name; object-group "
+                "classification for this model keeps the earlier layout.",
+                attn_desc.num_chunks_in_sw,
+                model_name,
+                exc_info=True,
+            )
+            return
+
+        with self._lock:
+            self._classifier_refs[model_name] = (
+                self._classifier_refs.get(model_name, 0) + 1
+            )
 
     def find(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
         """Look up a layout descriptor by (model_name, world_size).
@@ -302,6 +465,11 @@ class MPCacheServerContext:
             True.
         null_block_id: Engine block ID that denotes absent KV data.
         session_ttl_seconds: Idle seconds before a request session is reaped.
+        commit_config: How the ``END_SESSION`` handler decides whether a
+            finished request's final window is copied to L2 right away.
+            Defaults to ``turn_end`` accepting any stop token. A model
+            without windowed object groups never has anything to commit,
+            whatever the policy.
     """
 
     def __init__(
@@ -313,6 +481,7 @@ class MPCacheServerContext:
         full_sw_kv: bool = False,
         null_block_id: int = 0,
         session_ttl_seconds: float = SessionManager.DEFAULT_SESSION_TTL,
+        commit_config: CommitPolicyConfig = DEFAULT_COMMIT_CONFIG,
     ) -> None:
         self._configured_chunk_size = chunk_size
         self._chunk_size = chunk_size
@@ -326,6 +495,8 @@ class MPCacheServerContext:
         self._next_chunk_size_bind_listener = 0
         self._separate_object_groups = separate_object_groups
         self._full_sw_kv = full_sw_kv
+        self._commit_config = commit_config
+        self._commit_policy = create_commit_policy(commit_config)
 
         self.shm_pool_info: ShmPoolInfo = self._compute_shm_pool_info(
             storage_manager_config
@@ -338,7 +509,9 @@ class MPCacheServerContext:
             self._token_hasher, ttl=session_ttl_seconds
         )
         self._event_bus = get_event_bus()
-        self._layout_desc_registry = LayoutDescRegistry()
+        self._layout_desc_registry = LayoutDescRegistry(
+            self._storage_manager.object_group_classifier
+        )
 
     def close(self) -> None:
         """
@@ -461,6 +634,16 @@ class MPCacheServerContext:
         return self._full_sw_kv
 
     @property
+    def commit_config(self) -> CommitPolicyConfig:
+        """How this server decides and places window commits."""
+        return self._commit_config
+
+    @property
+    def commit_policy(self) -> CommitPolicy:
+        """The configured commit policy."""
+        return self._commit_policy
+
+    @property
     def storage_manager(self) -> StorageManager:
         """The storage manager instance."""
         return self._storage_manager
@@ -525,6 +708,7 @@ class MPCacheServerContext:
         """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(key.token_bytes)
+        session.note_resolved(key.end)
         if session.lookup_ipc_key is None:
             session.lookup_ipc_key = key.no_worker_id_version()
         # A partial chunk past the last chunk boundary is not a full chunk;

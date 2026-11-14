@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Msgpack codec for multiprocess messages, and the old import path of
-:class:`lmcache.v1.common.custom_types.BlockAllocationRecord`."""
+"""Msgpack codec for multiprocess messages, and the old import path of the
+shared protocol types in :mod:`lmcache.v1.common.custom_types`."""
 
 # Standard
 from dataclasses import dataclass
@@ -11,12 +11,49 @@ import msgspec
 import torch
 
 # First Party
-from lmcache.v1.common.custom_types import BlockAllocationRecord
-from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
+from lmcache.v1.common.custom_types import (
+    KV_EVENT_KIND_REMOVED,
+    KV_EVENT_KIND_STORED,
+    KV_EVENT_MEDIUM_CPU,
+    NO_SESSION_END_INFO,
+    TRANSFER_QUERY,
+    BlockAllocationRecord,
+    CBMatchResult,
+    CBUnifiedLookupResult,
+    GroupLayout,
+    IPCCacheServerKey,
+    KVEventBatch,
+    KVEventRecord,
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
+    RegisterEngineDrivenContextPayload,
+    RegisterEngineDrivenContextResponse,
+    RegisterKVCacheResponse,
+    SessionEndInfo,
+)
+from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper, KVCache
 
 __all__ = [
+    "KV_EVENT_KIND_REMOVED",
+    "KV_EVENT_KIND_STORED",
+    "KV_EVENT_MEDIUM_CPU",
+    "NO_SESSION_END_INFO",
+    "TRANSFER_QUERY",
     "BlockAllocationRecord",
+    "CBMatchResult",
+    "CBUnifiedLookupResult",
     "CustomizedSerdeConfig",
+    "GroupLayout",
+    "IPCCacheServerKey",
+    "KVCache",
+    "KVEventBatch",
+    "KVEventRecord",
+    "PrepareRetrieveResponse",
+    "PrepareStoreResponse",
+    "RegisterEngineDrivenContextPayload",
+    "RegisterEngineDrivenContextResponse",
+    "RegisterKVCacheResponse",
+    "SessionEndInfo",
     "get_customized_decoder",
     "get_customized_encoder",
 ]

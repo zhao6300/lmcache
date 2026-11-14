@@ -843,6 +843,25 @@ class TestKernelAndObjectGroups:
         assert by_layer[1].calculate_slots(256) == 2
         assert by_layer[0].calculate_slots(256) == 64
 
+    def test_per_request_state_group_is_one_block_per_chunk(self):
+        # A ring of 8 slots per block: whatever the slot count, its single
+        # per-request block covers a whole LMCache chunk.
+        tensors = [
+            torch.randn(2, 8, 16, 1, 64, dtype=torch.float16),
+            torch.randn(2, 8, 8, 1, 32, dtype=torch.float32),
+        ]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,), tokens_per_block=16),
+                EngineGroupInfo(1, (1,), per_request_state=True),
+            ],
+        )
+        by_layer = {g.layer_indices[0]: g for g in manager.kernel_groups}
+        assert by_layer[1].tokens_per_block == 256
+        assert manager.calculate_num_blocks(1, 256) == 1
+        assert manager.calculate_num_blocks(0, 256) == 16
+
     def test_calculate_num_blocks_compressed(self):
         # slots_per_block=8 (tensor), tokens_per_block=16 (engine spec) ->
         # compress_ratio=2; 256 logical tokens -> 128 physical slots ->
@@ -894,6 +913,66 @@ def test_bundled_object_group_is_replicated_only_if_all_kernel_groups_are():
         _fold_shard_replication_desc(manager.object_groups, infos)
         == ShardReplicationDesc()
     )
+
+
+class TestPrefixReplayObjectGroups:
+    """Prefix-replay windows get their own optional-window object group."""
+
+    @staticmethod
+    def _tensors(n: int) -> list[torch.Tensor]:
+        return [torch.randn(2, 32, 32, 8, 64, dtype=torch.float16) for _ in range(n)]
+
+    def test_separation_off_splits_replay_windows(self):
+        manager = _build_manager(
+            self._tensors(3),
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), sw_size_tokens=128, prefix_replay=True),
+                EngineGroupInfo(2, (2,), sw_size_tokens=128, prefix_replay=True),
+            ],
+        )
+        assert [g.kernel_group_indices for g in manager.object_groups] == [
+            [0],
+            [1, 2],
+        ]
+        desc = manager.get_attn_desc()
+        assert desc.num_chunks_in_sw == [-1, 1]
+        assert desc.optional_window == (False, True)
+
+    def test_separation_on_keeps_replay_apart_from_plain_window(self):
+        manager = _build_manager(
+            self._tensors(3),
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), sw_size_tokens=128),
+                EngineGroupInfo(2, (2,), sw_size_tokens=128, prefix_replay=True),
+            ],
+            separate_object_groups=True,
+        )
+        assert manager.num_object_groups == 3
+        desc = manager.get_attn_desc()
+        assert desc.optional_window == (False, False, True)
+
+    def test_no_replay_groups_report_no_optional_windows(self):
+        manager = _build_manager(
+            self._tensors(2),
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), sw_size_tokens=128),
+            ],
+        )
+        assert manager.get_attn_desc().optional_window == ()
+
+    def test_replay_groups_with_different_windows_raise(self):
+        with pytest.raises(ValueError):
+            _build_manager(
+                self._tensors(3),
+                engine_group_infos=[
+                    EngineGroupInfo(0, (0,)),
+                    EngineGroupInfo(1, (1,), sw_size_tokens=128, prefix_replay=True),
+                    EngineGroupInfo(2, (2,), sw_size_tokens=512, prefix_replay=True),
+                ],
+            )
 
 
 if __name__ == "__main__":

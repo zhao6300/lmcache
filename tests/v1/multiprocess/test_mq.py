@@ -30,6 +30,7 @@ from lmcache.v1.client.transport.zmq_impl.mq_client import (
 from lmcache.v1.common.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    RegisterKVCacheResponse,
 )
 from lmcache.v1.common.transfer_channel.api import TransferChannelAddress
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey, get_request_tags
@@ -454,7 +455,8 @@ def test_mq_noop_multiple_clients():
 def test_mq_register_kv_cache():
     """
     Test MessageQueue with REGISTER_KV_CACHE request type.
-    REGISTER_KV_CACHE takes (gpu_id: int, kv_cache: KVCache) and returns None.
+    REGISTER_KV_CACHE takes (gpu_id: int, kv_cache: KVCache) and returns a
+    registration response.
     """
     # First Party
     from lmcache.v1.platform.devices.cuda.ipc_wrapper import CudaIPCWrapper
@@ -486,7 +488,7 @@ def test_mq_register_kv_cache():
             {"vllm_block_size": 16},
             [],
         ],
-        expected_response=None,
+        expected_response=RegisterKVCacheResponse(),
         num_requests=1,
     )
 

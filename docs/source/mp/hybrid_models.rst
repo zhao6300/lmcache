@@ -144,10 +144,15 @@ layer share a single full-attention object group.
    lmcache server --chunk-size 256 --l1-size-gb 100 --no-separate-object-groups
 
 For a non-hybrid model (a single attention behavior) the setting makes no
-difference — every layer resolves to one object group either way. For a
-**Mamba / linear-attention hybrid it is required** (see below): it gives the
-linear-attention layers their own cache objects so their recurrent state is
-stored and loaded independently of the full-attention layers.
+difference — every layer resolves to one object group either way. It is
+required when a **hybrid model has different object-group semantics**: it keeps
+full-attention, sliding-window, and recurrent-state groups in independent cache
+objects. Multiple engine groups with identical semantics may share one object.
+
+Registration of groups that map to different object buckets, or any
+recurrent-state group, fails immediately when the server was started without
+``--separate-object-groups``. The error is returned to the serving engine with
+instructions to restart the LMCache server with the flag.
 
 Mamba / Linear-Attention Hybrids
 --------------------------------

@@ -241,6 +241,8 @@ def test_lookup_hint_carries_vllm_prefix_hit() -> None:
     connector._save_unfull_chunk = False
     connector.lazy_offload = False
     connector._hit_alignment_tokens = 64
+    connector._prefix_replay_tokens = 0
+    connector._prefix_replay_group_ids = ()
 
     assert connector.get_num_new_matched_tokens(request, 16) == (None, True)
     assert scheduler_adapter.maybe_submit_lookup_request.call_args.kwargs[
@@ -260,6 +262,8 @@ def test_recurrent_lookup_reserves_final_prompt_token() -> None:
     connector._reserve_last_token_for_lookup = True
     connector._save_unfull_chunk = False
     connector._hit_alignment_tokens = 64
+    connector._prefix_replay_tokens = 0
+    connector._prefix_replay_group_ids = ()
     connector._connector_stats = MagicMock()
     connector.lazy_offload = False
 

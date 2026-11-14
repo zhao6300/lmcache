@@ -17,10 +17,18 @@ numpy<=2.2.6; python_version < "3.14"
 numpy; python_version >= "3.14"
 numba
 nvtx
-opentelemetry-api >= 1.20.0, <= 1.40.0
-opentelemetry-sdk >= 1.20.0
-opentelemetry-exporter-otlp >= 1.20.0
-opentelemetry-exporter-prometheus >= 0.50b0, <= 0.61b0
+# The four OpenTelemetry packages version in lockstep: each SDK release pins
+# the matching API exactly, and the Prometheus exporter pairs 0.NNb0 with
+# API 1.(NN-21). The 1.43 floor provides PrometheusMetricReader's
+# ``scope_info_enabled`` switch (otel_init.py turns the default scope labels
+# off so the /metrics exposition keeps its existing label set); 1.45.2 is
+# excluded because it caps each instrument at 2000 distinct attribute sets
+# and folds the rest into an ``otel.metric.overflow`` point, which would
+# silently drop the per-cache_salt series.
+opentelemetry-api >= 1.43.0, <= 1.45.1
+opentelemetry-sdk >= 1.43.0, <= 1.45.1
+opentelemetry-exporter-otlp >= 1.43.0, <= 1.45.1
+opentelemetry-exporter-prometheus >= 0.64b0, <= 0.66b1
 prometheus_client >= 0.18.0, <= 0.24.1
 psutil
 py-cpuinfo
@@ -34,7 +42,13 @@ grpcio-observability==1.78.0; platform_system == "Linux"
 protobuf>=6.31.1,<7
 redis
 safetensors
-setuptools>=77.0.3,<81.0.0
+# Only the floor is required: setuptools 77 adds the PEP 639 license
+# metadata used by pyproject.toml. There is no known incompatibility above
+# it -- the previous <81 cap came from a dependabot bump, not a breakage.
+# setup.py only uses stable APIs, and setuptools 82 dropping pkg_resources
+# does not affect the build because grpc_tools uses importlib.resources on
+# Python >= 3.9.
+setuptools>=77.0.3
 setuptools_scm>=8
 sortedcontainers
 # 1. avoid pinning torch version in the runtime dependencies so that 

@@ -90,6 +90,26 @@ class TestGroupedObjectKeys:
             _row(2, num_kv_readers=0)
 
 
+class TestAttnWindowDescOptionalWindow:
+    def test_flags_mark_only_the_optional_groups(self):
+        desc = AttnWindowDesc(num_chunks_in_sw=[-1, 1], optional_window=(False, True))
+        assert desc.is_optional_window(1)
+        assert not desc.is_optional_window(0)
+        assert not AttnWindowDesc(num_chunks_in_sw=[-1, 1]).is_optional_window(1)
+
+    @pytest.mark.parametrize(
+        "flags", [(True,), (True, False)], ids=["length-mismatch", "full-attention"]
+    )
+    def test_bad_flags_raise(self, flags):
+        with pytest.raises(ValueError):
+            AttnWindowDesc(num_chunks_in_sw=[-1, 1], optional_window=flags)
+
+    def test_all_optional_raises(self) -> None:
+        """A request needs a required group to set its hit length."""
+        with pytest.raises(ValueError, match="at least one group"):
+            AttnWindowDesc(num_chunks_in_sw=[1, 1], optional_window=(True, True))
+
+
 class TestPrefetchTaskSpecValidation:
     def test_defaults(self):
         spec = PrefetchTaskSpec(key_groups=[_row(3)])
@@ -204,6 +224,18 @@ class TestIpcKeyToGroupedObjectKeys:
         assert sorted((k for r in rows for k in r.keys), key=repr) == sorted(
             (k for g in flat for k in g), key=repr
         )
+
+    def test_optional_window_flag_reaches_rows(self):
+        attn = AttnWindowDesc(num_chunks_in_sw=[-1, 1], optional_window=(False, True))
+        rows = ipc_key_to_grouped_object_keys(
+            _ipc_key(1),
+            [b"c0"],
+            [0, 1],
+            {0: LAYOUT, 1: LAYOUT},
+            attn,
+            DEFAULT_SHARD_REPLICATION_DESC,
+        )
+        assert [r.optional_window for r in rows] == [False, True]
 
     def test_worker_specific_key_yields_one_row_per_group(self):
         attn = AttnWindowDesc(num_chunks_in_sw=[-1], world_size=2)
@@ -323,3 +355,36 @@ class TestDcpShardedReplicatedGroups:
     def test_dcp_shards_must_parallel_tp_replicas(self):
         with pytest.raises(ValueError, match="group_dcp_shards"):
             ShardReplicationDesc(group_tp_replicas=(4, 1), group_dcp_shards=(2,))
+
+
+class TestGroupsOnlySomeWorkersStore:
+    """``ShardReplicationDesc.group_storing_workers``: a pipeline stage stores
+    only its own layers' groups, so a group the other stages lack is
+    addressed on the storing workers' ranks only."""
+
+    def test_lookup_skips_workers_that_do_not_store_the_group(self):
+        shards = ShardReplicationDesc(
+            group_tp_replicas=(1, 1),
+            group_dcp_shards=(1, 1),
+            group_storing_workers=(None, frozenset({2, 3})),
+        )
+        per_group = ipc_key_to_object_keys(_ipc_key(4), [b"c0"], [0, 1], shards)
+        assert [k.kv_rank for k in per_group[0]] == [_kv_rank(4, r) for r in range(4)]
+        assert [k.kv_rank for k in per_group[1]] == [_kv_rank(4, 2), _kv_rank(4, 3)]
+
+    def test_a_replicated_group_keeps_its_storing_stages_first_rank(self):
+        """PP2 x TP2 with the group replicated per TP group, stored by stage 1
+        only: one object, keyed by stage 1's first rank."""
+        shards = ShardReplicationDesc(
+            group_tp_replicas=(2,),
+            group_dcp_shards=(1,),
+            group_storing_workers=(frozenset({2, 3}),),
+        )
+        per_group = ipc_key_to_object_keys(_ipc_key(4), [b"c0"], [0], shards)
+        assert [k.kv_rank for k in per_group[0]] == [_kv_rank(4, 2)]
+
+    def test_storing_workers_must_parallel_tp_replicas(self):
+        with pytest.raises(ValueError, match="group_storing_workers"):
+            ShardReplicationDesc(
+                group_tp_replicas=(1, 1), group_storing_workers=(None,)
+            )

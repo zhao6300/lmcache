@@ -1024,3 +1024,16 @@ def _ranges(*rs):
 )
 def test_covered_chunks(ranges, expected):
     assert covered_chunks(_ranges(*ranges), 256) == expected
+
+
+def test_shift_align_keeps_only_on_grid_occurrences():
+    """shift_align=2 skips an odd-shift occurrence and, since it runs before the
+    first-hit rule, still finds the later even-shift occurrence of the same chunk."""
+    matcher = BlendTokenRangeMatcher(chunk_size=4)
+    matcher.on_new_token_hashes([1, 2, 3, 4, 5, 6, 7, 8], [b"a", b"b"])
+    # Chunk "a" (stored at 0) occurs at cur_st 1 (odd shift) and 6 (even).
+    query = [9, 1, 2, 3, 4, 7, 1, 2, 3, 4]
+    default = matcher.match_sub_sequence(query)
+    assert [(m.cur_st, m.old_st) for m in default] == [(1, 0)]
+    aligned = matcher.match_sub_sequence(query, shift_align=2)
+    assert [(m.cur_st, m.old_st) for m in aligned] == [(6, 0)]

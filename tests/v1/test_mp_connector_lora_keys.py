@@ -51,7 +51,7 @@ ADAPTER_B = LoRARequest("adapter-b", 2, "/adapters/b")
 @dataclass
 class _FakeSamplingParams:
     extra_args: dict[str, object] | None = None
-    max_tokens: int = 16
+    max_tokens: int | None = None
 
 
 class _FakeRequest:
@@ -105,6 +105,9 @@ def _scheduler_connector(scheduler_adapter: MagicMock) -> LMCacheMPConnector:
     connector._hit_alignment_tokens = 64
     connector._connector_stats = MagicMock()
     connector._mamba_relocation_window = 0
+    connector._save_unfull_chunk = False
+    connector._prefix_replay_group_ids = ()
+    connector._prefix_replay_tokens = 0
     return connector
 
 

@@ -389,10 +389,16 @@ def _needs_l2_lookup(
     num_chunks = len(key_groups[0].keys)
     if fetching_policy == "full" or fetching_policy == "whole_chunk":
         return l1_found.popcount() < len(key_groups) * num_chunks
-    hit_length, _retain = fold_unfold_grouped(
-        l1_found.to_list(), [group.sliding_window_size for group in key_groups]
+    hit_length, retain = fold_unfold_grouped(
+        l1_found.to_list(),
+        [group.sliding_window_size for group in key_groups],
+        [group.optional_window for group in key_groups],
     )
-    return hit_length < num_chunks
+    window_missing = any(
+        group.optional_window and row.popcount() == 0
+        for group, row in zip(key_groups, retain, strict=True)
+    )
+    return hit_length < num_chunks or window_missing
 
 
 # Class definitions

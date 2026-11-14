@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
@@ -32,6 +32,10 @@ from lmcache.v1.common.token_codec import (
 if TYPE_CHECKING:
     # Third Party
     from vllm.v1.request import Request
+
+#: vLLM's null block id. It matches the server's default ``null_block_id``
+#: (0), whose all-null chunks the server skips on store.
+VLLM_NULL_BLOCK_ID = 0
 
 
 class LMCacheMPRequestState(enum.Enum):
@@ -83,6 +87,18 @@ class LMCacheMPRequestTracker:
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
+    # Whether the load also restores the prefix-replay windows, so vLLM
+    # skips recomputing them.
+    window_loaded: bool = False
+
+    # Boundaries (token counts) of the unfull chunks LMCache holds for this
+    # request's prompt (stored by it, or found by its lookup), so none is
+    # stored twice.
+    unfull_chunk_boundaries: set[int] = field(default_factory=set)
+
+    # Whether the request generates nothing past its first token, so no
+    # later forward writes its blocks after the prompt-end step.
+    ends_at_prompt: bool = False
 
     # Boundaries (token counts) of the unfull chunks LMCache holds for this
     # request's prompt (stored by it, or found by its lookup), so none is
@@ -327,6 +343,8 @@ class LMCacheMPRequestMetadata:
         group_tokens_per_block: list[int],
         *,
         save_decode_cache: bool = False,
+        prefix_replay_group_ids: Sequence[int] = (),
+        per_request_state_groups: Collection[int] = (),
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -342,6 +360,14 @@ class LMCacheMPRequestMetadata:
             save_decode_cache: Whether to store chunks containing generated
                 tokens. Defaults to storing only complete chunks within the
                 initial prompt, including when decode fills its partial tail.
+            prefix_replay_group_ids: Engine groups whose sliding window vLLM
+                recomputes by prefix replay. Their blocks are replaced by the
+                null block in every chunk ending before the prompt end, so the
+                server skips those windows: DeepSeek V4.1 runs its decoder
+                layers on only the trailing rows of each prefill step, so a
+                window ending inside the prompt holds stale decoder rows.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with every stored chunk.
 
         Returns:
             Metadata for newly storable chunks, or None when no complete
@@ -411,7 +437,23 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
             )
+            for group_idx in prefix_replay_group_ids:
+                blocks_per_chunk = (
+                    lmcache_tokens_per_chunk // group_tokens_per_block[group_idx]
+                )
+                for chunk_idx in range(num_chunks):
+                    chunk_end = start_token_idx + (chunk_idx + 1) * (
+                        lmcache_tokens_per_chunk
+                    )
+                    if chunk_end >= tracker.num_prompt_tokens:
+                        break
+                    lo = chunk_idx * blocks_per_chunk
+                    block_ids[group_idx][lo : lo + blocks_per_chunk] = [
+                        VLLM_NULL_BLOCK_ID
+                    ] * blocks_per_chunk
             token_bytes = tracker.packed_token_ids()
             op = LoadStoreOp(
                 token_bytes=token_bytes,
@@ -442,6 +484,8 @@ class LMCacheMPRequestMetadata:
         tail_grid_tokens: int,
         boundary_state_blocks: Mapping[int, Mapping[int, int]],
         boundary_state_groups: Collection[int],
+        *,
+        per_request_state_groups: Collection[int] = (),
     ) -> list[tuple["LMCacheMPRequestMetadata", list[int]]]:
         """Generate store metadata for the prompt's newly storable unfull chunks.
 
@@ -479,6 +523,8 @@ class LMCacheMPRequestMetadata:
                 ``{boundary token: {engine group: block id}}``.
             boundary_state_groups: Engine groups whose state at a grid
                 boundary must come from ``boundary_state_blocks``.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with the unfull chunk.
 
         Returns:
             One ``(metadata, boundary-state block IDs it reads)`` pair per newly
@@ -534,6 +580,8 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 chunk_start,
                 boundary,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
                 include_unfull_chunk=True,
             )
             if boundary_state_block_ids:
@@ -566,6 +614,8 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        *,
+        per_request_state_groups: Collection[int] = (),
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the retrieve metadata for the current request tracker.
@@ -578,6 +628,8 @@ class LMCacheMPRequestMetadata:
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different
                 values); ``0`` marks a scratch group that is never retrieved.
+            per_request_state_groups: Engine groups holding per-request state;
+                their block rides with every retrieved chunk.
 
         Note:
             A hit that does not end on a chunk boundary ends with the unfull
@@ -608,6 +660,8 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                tokens_per_chunk=lmcache_tokens_per_chunk,
+                per_request_state_groups=per_request_state_groups,
                 include_unfull_chunk=include_unfull_chunk,
             )
             token_bytes = tracker.packed_token_ids()

@@ -31,10 +31,14 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     get_lmcache_chunk_size,
 )
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
-from lmcache.v1.client.transport.errors import MPServerUnavailableError
+from lmcache.v1.client.transport.errors import (
+    MPRequestError,
+    MPServerUnavailableError,
+)
 from lmcache.v1.common.custom_types import (
     KVEventBatch,
     KVEventRecord,
+    RegisterKVCacheResponse,
 )
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.token_codec import pack_token_ids
@@ -390,7 +394,7 @@ def fake_adapter(monkeypatch):
     monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
 
     future = MagicMock(name="future")
-    future.result.return_value = None
+    future.result.return_value = RegisterKVCacheResponse()
     _return_future_from_request_methods(req_client, future)
     req_client.get_experimental.return_value = MagicMock()
     req_client.get_experimental.return_value.result.return_value = []
@@ -444,6 +448,41 @@ def test_scheduler_reset_cache_clears_every_server_without_force(
         futures[server].result.assert_called_once_with(
             timeout=expected_timeouts[server]
         )
+
+
+@pytest.mark.parametrize(
+    "answers,expected",
+    [((True, True), True), ((True, False), False)],
+    ids=["every-server-served", "one-server-missed"],
+)
+def test_scheduler_query_lookup_window_needs_every_server(
+    answers: tuple[bool, bool], expected: bool
+) -> None:
+    """The window counts as served only if every server locked it."""
+    adapter, clients = _make_scheduler_adapter(["server-a", "server-b"])
+    for client, answer in zip(clients.values(), answers, strict=True):
+        client.query_lookup_window.return_value = ready_future(answer)
+
+    assert adapter.query_lookup_window("req") is expected
+    for client in clients.values():
+        client.query_lookup_window.assert_called_once_with("req")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError("no answer"), MPRequestError("INTERNAL", "handler failed")],
+    ids=["timeout", "request-failed"],
+)
+def test_scheduler_query_lookup_window_failure_means_not_served(
+    error: Exception,
+) -> None:
+    """A server that times out or fails the RPC sends vLLM back to replay."""
+    adapter, clients = _make_scheduler_adapter(["server-a"])
+    future = MagicMock(name="window_future")
+    future.result.side_effect = error
+    clients["server-a"].query_lookup_window.return_value = future
+
+    assert adapter.query_lookup_window("req") is False
 
 
 def test_scheduler_reset_cache_keeps_lookups_in_flight(

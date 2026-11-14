@@ -22,13 +22,20 @@ from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.token_codec import unpack_token_ids
 from lmcache.v1.common.token_hasher import TokenHasher
 from lmcache.v1.common.utils import LayoutHints
+from lmcache.v1.multiprocess.custom_types import RegisterKVCacheResponse
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
     ShardReplicationDesc,
 )
+from lmcache.v1.distributed.storage_controllers.store_policy import (
+    OPTIONAL_WINDOW_ATTRIBUTE,
+)
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion, l1_owners_of
-from lmcache.v1.kv_layer_groups import ObjectGroupInfo
+from lmcache.v1.kv_layer_groups import (
+    ObjectGroupInfo,
+    requires_object_group_separation,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -499,7 +506,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
-    ) -> None:
+    ) -> RegisterKVCacheResponse:
         """Register the KV cache tensors for a given GPU instance ID.
 
         Args:
@@ -514,7 +521,29 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+
+        Returns:
+            The registration result. A configuration error is returned to the
+            worker so transports that cannot propagate handler exceptions do
+            not turn it into a timeout.
         """
+        requires_separate_object_groups = requires_object_group_separation(
+            engine_group_infos,
+            self._ctx.chunk_size,
+        )
+        if not self._ctx.separate_object_groups and requires_separate_object_groups:
+            error_message = (
+                "Cannot register KV cache groups with distinct object semantics "
+                "or recurrent state because the LMCache server was started without "
+                "--separate-object-groups. Restart the server with "
+                "--separate-object-groups and try again."
+            )
+            logger.error(error_message)
+            return RegisterKVCacheResponse(
+                succeed=False,
+                error_message=error_message,
+            )
+
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
         # worker re-registering on its first ping) refreshes its last-seen
@@ -528,7 +557,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     "Instance %d already registered; refreshing liveness",
                     instance_id,
                 )
-                return
+                return RegisterKVCacheResponse()
 
         # Build the context and layout descriptor outside the lock.
         cache_context = self._create_cache_context(
@@ -585,6 +614,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             instance_id,
             cache_context.num_layers,
         )
+        return RegisterKVCacheResponse()
 
     @request_handler()
     def unregister_kv_cache(self, instance_id: int) -> None:
@@ -705,6 +735,12 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             else []
         )
         num_chunks = len(obj_keys_per_obj_group[0])
+        # Let the store policy tell optional (prefix-replay) windows apart.
+        store_attn_desc = cache_context.kv_layer_groups_manager.get_attn_desc()
+        for obj_group_id, group_keys in enumerate(obj_keys_per_obj_group):
+            if store_attn_desc.is_optional_window(obj_group_id):
+                for obj_key in group_keys:
+                    obj_key.extra_attributes[OPTIONAL_WINDOW_ATTRIBUTE] = True
 
         # NOTE: different engine groups may have different block sizes, so
         # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
@@ -1139,6 +1175,23 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             skipped_groups = {
                 g for g, kind in enumerate(attn_desc.group_kinds) if kind == "aux"
             }
+            # Optional windows the lookup did not lock are left to the engine,
+            # which recomputes them (prefix replay). The lookup locks a window
+            # only at its hit end, so a retrieve that stops short of it (the
+            # connector gave chunks back) has no locked window either.
+            if attn_desc.optional_window:
+                session = self._ctx.session_manager.get(key.request_id)
+                locked_gids = (
+                    session.prefetch_locked_gids
+                    if session is not None
+                    and key.end // self._ctx.chunk_size == session.prefetch_hit_chunks
+                    else ()
+                )
+                skipped_groups |= {
+                    g
+                    for g in range(num_object_groups)
+                    if attn_desc.is_optional_window(g) and g not in locked_gids
+                }
             group_skips = [
                 0 if window < 0 else max(0, num_chunks - window)
                 for window in attn_desc.num_chunks_in_sw

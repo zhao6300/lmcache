@@ -55,6 +55,14 @@ class IpcCacheServerKey(_message.Message):
     encoded_request_configs: bytes
     def __init__(self, model_name: _Optional[str] = ..., world_size: _Optional[int] = ..., worker_id: _Optional[int] = ..., token_bytes: _Optional[bytes] = ..., start: _Optional[int] = ..., end: _Optional[int] = ..., request_id: _Optional[str] = ..., cache_salt: _Optional[str] = ..., encoded_request_configs: _Optional[bytes] = ...) -> None: ...
 
+class SessionEndInfo(_message.Message):
+    __slots__ = ("finish_reason", "stop_token_id")
+    FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
+    STOP_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    finish_reason: str
+    stop_token_id: int
+    def __init__(self, finish_reason: _Optional[str] = ..., stop_token_id: _Optional[int] = ...) -> None: ...
+
 class EventIpcHandleResult(_message.Message):
     __slots__ = ("event_ipc_handle", "success")
     EVENT_IPC_HANDLE_FIELD_NUMBER: _ClassVar[int]
@@ -76,7 +84,7 @@ class DeviceIpcWrapper(_message.Message):
     def __init__(self, descriptor_payload: _Optional[bytes] = ...) -> None: ...
 
 class EngineGroupInfo(_message.Message):
-    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state", "tp_replicas", "dcp_shards")
+    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state", "tp_replicas", "dcp_shards", "prefix_replay", "per_request_state")
     ENGINE_GROUP_ID_FIELD_NUMBER: _ClassVar[int]
     LAYER_INDICES_FIELD_NUMBER: _ClassVar[int]
     TOKENS_PER_BLOCK_FIELD_NUMBER: _ClassVar[int]
@@ -85,6 +93,8 @@ class EngineGroupInfo(_message.Message):
     RECURRENT_STATE_FIELD_NUMBER: _ClassVar[int]
     TP_REPLICAS_FIELD_NUMBER: _ClassVar[int]
     DCP_SHARDS_FIELD_NUMBER: _ClassVar[int]
+    PREFIX_REPLAY_FIELD_NUMBER: _ClassVar[int]
+    PER_REQUEST_STATE_FIELD_NUMBER: _ClassVar[int]
     engine_group_id: int
     layer_indices: _containers.RepeatedScalarFieldContainer[int]
     tokens_per_block: int
@@ -93,4 +103,6 @@ class EngineGroupInfo(_message.Message):
     recurrent_state: bool
     tp_replicas: int
     dcp_shards: int
-    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ..., tp_replicas: _Optional[int] = ..., dcp_shards: _Optional[int] = ...) -> None: ...
+    prefix_replay: bool
+    per_request_state: bool
+    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ..., tp_replicas: _Optional[int] = ..., dcp_shards: _Optional[int] = ..., prefix_replay: bool = ..., per_request_state: bool = ...) -> None: ...

@@ -9,10 +9,17 @@ The store policy makes two decisions after data is written to L1:
 
 # Standard
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.object_group_classifier import ObjectGroupClassifier
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
+
+OPTIONAL_WINDOW_ATTRIBUTE = "lmcache.store.optional_window"
+"""``ObjectKey.extra_attributes`` flag set by the server on keys of an
+optional-window object group (``AttnWindowDesc.optional_window``), e.g. the
+DeepSeek V4.1 sliding-window KV that vLLM can recompute by prefix replay."""
 
 
 class StorePolicy(ABC):
@@ -62,10 +69,18 @@ class StorePolicy(ABC):
 
 
 # -----------------------------------------------------------------------------
-# Registry: store policy name -> policy class
+# Registry: store policy name -> store policy factory
 # -----------------------------------------------------------------------------
 
-_STORE_POLICY_REGISTRY: dict[str, type[StorePolicy]] = {}
+StorePolicyFactory = Callable[[ObjectGroupClassifier], StorePolicy]
+"""Builds a store policy from the storage manager's object-group classifier.
+
+Policies that do not classify object groups ignore the argument; the
+classifier is passed to every factory so that ``create_store_policy`` needs no
+per-policy knowledge.
+"""
+
+_STORE_POLICY_REGISTRY: dict[str, StorePolicyFactory] = {}
 
 
 def register_store_policy(
@@ -73,17 +88,43 @@ def register_store_policy(
     policy_cls: type[StorePolicy],
 ) -> None:
     """
-    Register a store policy class under a name.
+    Register a store policy class that is constructed without arguments.
 
-    Each policy module should call this at import time.
+    Each policy module should call this at import time. Policies that need the
+    object-group classifier must use :func:`register_store_policy_factory`
+    instead.
 
     Args:
         name: Policy name (e.g. "default").
-        policy_cls: A concrete StorePolicy subclass.
+        policy_cls: A concrete StorePolicy subclass with a no-argument
+            constructor.
+
+    Raises:
+        ValueError: If a policy is already registered under the given name.
+    """
+    register_store_policy_factory(name, lambda classifier: policy_cls())
+
+
+def register_store_policy_factory(
+    name: str,
+    factory: StorePolicyFactory,
+) -> None:
+    """
+    Register a store policy factory under a name.
+
+    Use this for policies that need the object-group classifier; the factory
+    receives the classifier owned by the storage manager.
+
+    Args:
+        name: Policy name (e.g. "defer_windowed").
+        factory: Callable building a StorePolicy from a classifier.
+
+    Raises:
+        ValueError: If a policy is already registered under the given name.
     """
     if name in _STORE_POLICY_REGISTRY:
         raise ValueError(f"Store policy already registered: {name!r}")
-    _STORE_POLICY_REGISTRY[name] = policy_cls
+    _STORE_POLICY_REGISTRY[name] = factory
 
 
 def get_registered_store_policies() -> list[str]:
@@ -91,12 +132,17 @@ def get_registered_store_policies() -> list[str]:
     return list(_STORE_POLICY_REGISTRY)
 
 
-def create_store_policy(name: str) -> StorePolicy:
+def create_store_policy(
+    name: str,
+    classifier: ObjectGroupClassifier,
+) -> StorePolicy:
     """
     Create a store policy instance by name.
 
     Args:
         name: Registered policy name.
+        classifier: The object-group classifier the policy should consult.
+            Policies that do not classify object groups ignore it.
 
     Returns:
         A new StorePolicy instance.
@@ -107,7 +153,7 @@ def create_store_policy(name: str) -> StorePolicy:
     if name not in _STORE_POLICY_REGISTRY:
         known = ", ".join(sorted(_STORE_POLICY_REGISTRY)) or "(none)"
         raise ValueError(f"Unknown store policy {name!r}. Known: {known}")
-    return _STORE_POLICY_REGISTRY[name]()
+    return _STORE_POLICY_REGISTRY[name](classifier)
 
 
 class DefaultStorePolicy(StorePolicy):
@@ -178,5 +224,40 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
         return list(keys)
 
 
+class WindowInL1StorePolicy(BufferOnlyStorePolicy):
+    """DeepSeek V4/V4.1 style placement: windows in L1, the rest in L2 only.
+
+    Keys flagged with :data:`OPTIONAL_WINDOW_ATTRIBUTE` (sliding windows the
+    engine recomputes when they are missing) never go to L2 and stay in L1
+    under its eviction policy. Every other key is stored to all adapters and
+    then deleted from L1: ``select_l1_deletions`` is inherited from
+    ``skip_l1``.
+    """
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[L2AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        """
+        Store every key except the optional windows to all adapters.
+
+        Args:
+            keys: Keys that were just written to L1.
+            adapters: Descriptors of available L2 adapters.
+
+        Returns:
+            Mapping from every adapter index to the keys without the
+            optional-window flag.
+        """
+        l2_keys = [
+            key
+            for key in keys
+            if not key.extra_attributes.get(OPTIONAL_WINDOW_ATTRIBUTE)
+        ]
+        return {ad.index: list(l2_keys) for ad in adapters}
+
+
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+register_store_policy("swa_l1", WindowInL1StorePolicy)

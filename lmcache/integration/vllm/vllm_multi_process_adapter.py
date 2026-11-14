@@ -45,10 +45,12 @@ from lmcache.v1.client.worker_transfer import TransferContext, create_transfer_c
 from lmcache.v1.common.custom_types import (
     KV_EVENT_KIND_REMOVED,
     KV_EVENT_KIND_STORED,
+    NO_SESSION_END_INFO,
     BlockAllocationRecord,
     IPCCacheServerKey,
     KVEventBatch,
     KVEventRecord,
+    SessionEndInfo,
 )
 from lmcache.v1.common.group_view import (
     EngineGroupInfo,
@@ -895,6 +897,39 @@ class LMCacheMPSchedulerAdapter:
         if lookup is not None:
             lookup.close()
 
+    def query_lookup_window(self, request_id: str) -> bool:
+        """Ask every server whether the request's lookup served its windows.
+
+        Call only after :meth:`check_lookup_result` returned a positive
+        count. The optional (prefix-replay) windows count as loaded only if
+        every backing server locked them.
+
+        Args:
+            request_id: The ID of the request whose lookup resolved.
+
+        Returns:
+            True if every server reports the windows present, False if any
+            server does not, or an RPC fails or times out.
+        """
+        deadline = time.monotonic() + self._mq_timeout
+        futures = {
+            url: self.req_clients[url].query_lookup_window(request_id)
+            for url in self._server_urls
+        }
+        for url, future in futures.items():
+            try:
+                if not future.result(timeout=max(0.0, deadline - time.monotonic())):
+                    return False
+            except REQUEST_FAILURES:
+                logger.warning(
+                    "QUERY_LOOKUP_WINDOW to %s failed or timed out; "
+                    "replaying the window.",
+                    url,
+                    exc_info=True,
+                )
+                return False
+        return True
+
     def reset_cache(self) -> bool:
         """Ask every backing LMCache server to best-effort clear idle cache.
 
@@ -1015,7 +1050,11 @@ class LMCacheMPSchedulerAdapter:
                 base_key, self.tp_size, extra_ranges
             )
 
-    def end_session(self, request_id: str) -> None:
+    def end_session(
+        self,
+        request_id: str,
+        end_info: SessionEndInfo = NO_SESSION_END_INFO,
+    ) -> None:
         """
         Notify LMCache server to remove the session for a finished request.
 
@@ -1026,6 +1065,9 @@ class LMCacheMPSchedulerAdapter:
 
         Args:
             request_id: The ID of the finished request.
+            end_info: How the request finished, for the server's commit
+                policy. Defaults to "nothing known", which every built-in
+                policy reads as "do not commit".
         """
         if not self.is_healthy:
             return
@@ -1038,7 +1080,7 @@ class LMCacheMPSchedulerAdapter:
                 return
 
         for url in self._server_urls:
-            self.req_clients[url].end_session(request_id)
+            self.req_clients[url].end_session(request_id, end_info)
 
     def report_block_allocations(
         self,
@@ -1645,6 +1687,7 @@ class LMCacheMPWorkerAdapter:
                 engine_group_infos=self.engine_group_infos,
                 engine_type=EngineType.VLLM,
                 lmcache_chunk_tokens=self.lmcache_tokens_per_chunk,
+                worker_id=self.worker_id,
             )
         except TimeoutError:
             # Never published, so there is nothing to roll back: close the

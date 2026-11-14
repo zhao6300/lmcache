@@ -233,6 +233,10 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             in protocol group order. Empty means legacy single-group; the
             top-level ``num_layers``/``hidden_dim_size``/``dtype_str`` then
             describe the sole group.
+        worker_id: The worker's id within ``world_size`` (the ``worker_id``
+            its store and retrieve keys carry), so the server looks each
+            object group up only on the workers that registered it. ``None``
+            (older clients) counts the groups as stored by every worker.
     """
 
     instance_id: int
@@ -245,6 +249,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     use_mla: bool
     num_physical_slots: int | None = None
     group_layouts: list[GroupLayout] = []
+    worker_id: int | None = None
 
 
 @dataclass
@@ -370,3 +375,50 @@ class KVEventBatch:
     next_cursor: int
     lost: bool
     events: list[KVEventRecord]
+
+
+@dataclass(frozen=True)
+class SessionEndInfo:
+    """What the engine knows about a finished request, sent with END_SESSION.
+
+    The commit policy decides from these facts whether the request's final
+    window is worth committing to L2 (see
+    ``lmcache/v1/multiprocess/commit_policy.py``). They are raw observations,
+    not a decision: the engine reports how the request ended and the policy
+    owns the rule.
+
+    Every field has a default so an engine adapter that knows nothing sends
+    ``SessionEndInfo()`` and the policy sees "no information", which every
+    built-in policy treats as "do not commit".
+    """
+
+    finish_reason: str = ""
+    """How the request finished, lowercased vLLM ``FinishReason`` ("stop",
+    "length", "abort", "error", "repetition"). Empty means unknown."""
+
+    stop_token_id: int = -1
+    """Token id the generation stopped on, ``-1`` when unknown or when it
+    stopped on a stop string, which is not a token. For a chat model this is
+    the turn-boundary marker the model emits to end its turn (Qwen:
+    ``<|im_end|>`` = 151645). The engine reports the last generated token when
+    it has no more specific stop reason, which is the ordinary case for a model
+    that ends its turn on its own EOS."""
+
+
+NO_SESSION_END_INFO = SessionEndInfo()
+"""The "engine reported nothing" value, for adapters that do not observe how a
+request finished. Shared because :class:`SessionEndInfo` is frozen."""
+
+
+@dataclass
+class RegisterKVCacheResponse:
+    """Result of registering an LMCache-driven KV cache.
+
+    Attributes:
+        succeed: Whether registration completed successfully.
+        error_message: Configuration error that prevented registration. Set
+            only when ``succeed`` is false.
+    """
+
+    succeed: bool = True
+    error_message: str = ""

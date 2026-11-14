@@ -23,6 +23,15 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.multiprocess.commit_policy import (
+    CommitContext,
+    resolve_anchor,
+    resolve_commit,
+)
+from lmcache.v1.multiprocess.custom_types import (
+    NO_SESSION_END_INFO,
+    SessionEndInfo,
+)
 from lmcache.v1.multiprocess.engine_context import (
     MPCacheServerContext,
     finish_lookup_read,
@@ -131,6 +140,8 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # Optional flag of each submitted key row, parallel to ``row_windows``.
+    row_optional_window: tuple[bool, ...] = ()
     # The lookup key, for the unfull-chunk stage that runs once the hit is
     # known; None on early exits, which never probe an unfull chunk.
     unfull_chunk_lookup_key: IPCCacheServerKey | None = None
@@ -383,6 +394,9 @@ class LookupModule(DiscoverableModule):
             _PrefetchJob(
                 handle=handle,
                 row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
+                row_optional_window=tuple(
+                    row.optional_window for row in spec.key_groups
+                ),
                 request_id=key.request_id,
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
@@ -466,6 +480,41 @@ class LookupModule(DiscoverableModule):
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
         return self.query_prefetch_status(request_id)
+
+    @request_handler(HandlerType.BLOCKING)
+    def query_lookup_window(self, request_id: str) -> bool:
+        """Report whether the request's lookup served its optional windows.
+
+        Optional-window groups (``AttnWindowDesc.optional_window``) never
+        shorten a hit; their windows are served all together or not at all.
+        The engine calls this after the lookup resolved, to learn whether it
+        can skip recomputing those windows.
+
+        Args:
+            request_id: The external request ID passed in the lookup key.
+
+        Returns:
+            True if the lookup hit at least one chunk and locked the windows
+            of every optional-window group; False otherwise, including when
+            the model has no optional-window group or the request is unknown.
+        """
+        session = self._ctx.session_manager.get(request_id)
+        if session is None or session.lookup_ipc_key is None:
+            return False
+        key = session.lookup_ipc_key
+        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
+            key.model_name, key.world_size
+        )
+        optional_gids = [
+            gid
+            for gid in range(attn_desc.num_object_groups)
+            if attn_desc.is_optional_window(gid)
+        ]
+        return (
+            bool(optional_gids)
+            and session.prefetch_hit_chunks > 0
+            and all(gid in session.prefetch_locked_gids for gid in optional_gids)
+        )
 
     @request_handler(HandlerType.BLOCKING)
     def free_lookup_locks(
@@ -557,15 +606,25 @@ class LookupModule(DiscoverableModule):
         for range_start, range_end in extra_ranges:
             if range_start >= range_end:
                 continue
-            # An abandoned lookup's range ends at its hit boundary, so the
-            # range is its own lock model: resolve with that hit, not the
-            # current lookup's.
+            # An extra range ends at the hit of the lookup that locked it: the
+            # current lookup (a chunk it gave back) or one it replaced (an
+            # abandoned APC lookup). Resolve with that hit and the groups that
+            # lookup locked. A replaced lookup with the same hit as the
+            # current one is resolved with the current groups.
+            range_hit = range_end // self._ctx.chunk_size
+            range_gids = (
+                session.prefetch_locked_gids
+                if range_hit == hit_chunks
+                else session.replaced_locked_gids.get(
+                    range_hit, session.prefetch_locked_gids
+                )
+            )
             obj_keys.extend(
                 resolve_prefetched_obj_keys(
                     self._ctx,
                     replace(key, start=range_start, end=range_end),
-                    range_end // self._ctx.chunk_size,
-                    session.prefetch_locked_gids,
+                    range_hit,
+                    range_gids,
                 )
             )
         # A key ending at the unfull chunk the lookup locked releases it too.
@@ -586,7 +645,28 @@ class LookupModule(DiscoverableModule):
             self._ctx, key, obj_keys, self._ctx.get_read_owners(key.request_id)
         )
 
-    @request_handler(HandlerType.BLOCKING)
+    @request_handler(HandlerType.BLOCKING, operation="end_session")
+    def handle_end_session(
+        self,
+        request_id: str,
+        end_info: SessionEndInfo = NO_SESSION_END_INFO,
+    ) -> None:
+        """Handle ``END_SESSION``: commit the window, then end the session.
+
+        Two steps that know nothing about each other, in this order because
+        the commit reads the session :meth:`end_session` removes. Splitting
+        them here keeps the commit out of :meth:`end_session`, whose L1
+        bookkeeping is a separate concern with its own tests.
+
+        Args:
+            request_id: The request ID that finished.
+            end_info: How the engine says the request finished. Only the
+                commit reads it. Defaults to "nothing known", which every
+                built-in policy reads as "do not commit".
+        """
+        self._maybe_commit_window(request_id, end_info)
+        self.end_session(request_id)
+
     def end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.
 
@@ -627,6 +707,96 @@ class LookupModule(DiscoverableModule):
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    def _maybe_commit_window(
+        self,
+        request_id: str,
+        end_info: SessionEndInfo,
+    ) -> None:
+        """Copy the finished request's live window to L2 if it earned it.
+
+        Whether the store path writes windowed chunks to L2 is the
+        store policy's decision; a window that only L1 holds is lost when L1
+        evicts it, and the next turn of the same conversation pays a full
+        prefill. A commit does not depend on that decision: when a request
+        ends where a follow-up will resume -- a chat turn boundary -- its
+        final window is copied to L2 during the idle time before that
+        follow-up arrives.
+
+        It is a copy, not a move: the L1 window stays, so the follow-up is
+        still an L1 hit and only the window's durability changed. Nothing else
+        about the session's bookkeeping changes, and a commit that never
+        happens costs timeliness, not correctness.
+
+        Which chunks: for every windowed object group with window ``w``, the
+        ``w`` chunks ending at each anchor, expanded over the kv ranks with
+        the registration's ``ShardReplicationDesc`` so that a group the
+        tensor-parallel ranks replicate names the one object they stored.
+        Whole-prefix groups are skipped -- the store path already wrote them
+        through. Anchors come
+        from :func:`resolve_anchor`, which is why this method, and not the
+        caller, knows about ``w``: an anchor is an end offset and each group
+        derives its own start from it.
+
+        Args:
+            request_id: The finished request, whose session is still
+                registered: this runs before :meth:`end_session` removes it.
+            end_info: How the engine says the request finished.
+        """
+        commit_config = self._ctx.commit_config
+        session = self._ctx.session_manager.get(request_id)
+        if session is None:
+            return
+        key = session.lookup_ipc_key
+        if key is None:
+            return
+
+        chunk_size = session.hasher.chunk_size
+        registry = self._ctx.layout_desc_registry
+        attn_desc = registry.find_attn_desc(key.model_name, key.world_size)
+        shard_replication_desc = registry.find_shard_replication_desc(
+            key.model_name, key.world_size
+        )
+        ctx = CommitContext(
+            request_id=session.request_id,
+            end_info=end_info,
+            model_name=key.model_name,
+            prompt_end=session.lookup_end,
+            stored_end=session.resolved_end,
+            hit_chunks=session.prefetch_hit_chunks,
+            attn_desc=attn_desc,
+            anchor=commit_config.anchor,
+        )
+        if not resolve_commit(ctx, self._ctx.commit_policy):
+            return
+
+        anchor = resolve_anchor(ctx, chunk_size)
+        if anchor <= 0:
+            return
+
+        anchor_chunk = anchor // chunk_size
+        hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, anchor)]
+        commit_keys: list[ObjectKey] = []
+        for group_id, window in enumerate(attn_desc.num_chunks_in_sw):
+            if window < 0:
+                continue  # whole prefix: already written through
+            lo = max(0, anchor_chunk - window)
+            commit_keys.extend(
+                ipc_key_to_object_keys(
+                    key, hashes[lo:anchor_chunk], [group_id], shard_replication_desc
+                )[0]
+            )
+
+        if not commit_keys:
+            return
+
+        logger.debug(
+            "Committing %d windowed key(s) for request %s at anchor %d",
+            len(commit_keys),
+            session.request_id,
+            anchor,
+        )
+        self._ctx.storage_manager.copy_l1_keys_to_l2(commit_keys)
 
     def _all_object_keys(
         self,
@@ -738,13 +908,25 @@ class LookupModule(DiscoverableModule):
         result = self._ctx.storage_manager.query_prefetch_status(job.handle)
         if result is None:
             return None
+        locked_gids = tuple(range(job.attn_desc.num_object_groups))
         if job.row_windows:
-            found_count, _retain = fold_unfold_grouped(
-                result.hit_cells, job.row_windows
+            found_count, retain = fold_unfold_grouped(
+                result.hit_cells, job.row_windows, job.row_optional_window
             )
             l1_found_count, _l1_retain = fold_unfold_grouped(
-                result.l1_hit_cells, job.row_windows
+                result.l1_hit_cells, job.row_windows, job.row_optional_window
             )
+            # The optional rows are retained all together or not at all; when
+            # their window is absent nothing of them is locked.
+            if any(job.row_optional_window) and any(
+                is_opt and row.popcount() == 0
+                for is_opt, row in zip(job.row_optional_window, retain, strict=True)
+            ):
+                locked_gids = tuple(
+                    gid
+                    for gid in locked_gids
+                    if not job.attn_desc.is_optional_window(gid)
+                )
         else:
             # Nothing was submitted (early exit), so nothing can be hit.
             found_count = 0
@@ -773,7 +955,7 @@ class LookupModule(DiscoverableModule):
         )
         session.record_prefetch_result(
             found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
+            locked_gids,
             {**result.l1_owners, **unfull_chunk_owners},
         )
 

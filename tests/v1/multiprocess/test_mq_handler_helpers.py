@@ -11,6 +11,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.common.custom_types import BlockAllocationRecord, IPCCacheServerKey
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.utils import LayoutHints
+from lmcache.v1.multiprocess.custom_types import RegisterKVCacheResponse
 from lmcache.v1.platform.base.ipc_wrapper import KVCache
 
 KeyType = IPCCacheServerKey
@@ -41,7 +42,7 @@ def register_kv_cache_handler(
     engine_type: EngineType,
     layout_hints: LayoutHints,
     engine_group_infos: list[EngineGroupInfo],
-) -> None:
+) -> RegisterKVCacheResponse:
     """
     Dummy handler for REGISTER_KV_CACHE requests.
 
@@ -56,7 +57,7 @@ def register_kv_cache_handler(
             msgspec-decoded from the request payload.
 
     Returns:
-        None
+        A successful registration response.
     """
     # In a real implementation, this would register the KV cache
     # For testing, we just validate the inputs are received correctly
@@ -79,7 +80,7 @@ def register_kv_cache_handler(
     assert isinstance(engine_group_infos, list), (
         f"Expected engine_group_infos to be a list, got {type(engine_group_infos)}"
     )
-    # No return value (returns None implicitly)
+    return RegisterKVCacheResponse()
 
 
 # ==============================================================================

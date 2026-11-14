@@ -50,7 +50,10 @@ _VALID_FETCHING_POLICIES = frozenset(get_args(FetchingPolicy))
 
 
 def _lookup_kv_ranks(
-    ipc_key: "IPCCacheServerKey", tp_replicas: int, dcp_shards: int
+    ipc_key: "IPCCacheServerKey",
+    tp_replicas: int,
+    dcp_shards: int,
+    storing_workers: frozenset[int] | None,
 ) -> list[int]:
     """The kv ranks an IPC key addresses, in rank order.
 
@@ -61,7 +64,8 @@ def _lookup_kv_ranks(
     Each shard is keyed by the first of those consecutive workers that holds
     it, so a lookup addresses ``dcp_shards`` ranks per ``tp_replicas``
     workers and a worker key the rank of its own shard. ``(1, 1)`` is the
-    per-rank layout.
+    per-rank layout. Workers outside ``storing_workers`` (``None``: every
+    worker) never store the group, so their ranks are skipped.
     """
     if ipc_key.worker_id is None:
         # For look up request, we want to expand to all workers
@@ -75,6 +79,8 @@ def _lookup_kv_ranks(
     else:
         w = ipc_key.worker_id
         worker_ids = [w - w % tp_replicas + w % dcp_shards]
+    if storing_workers is not None:
+        worker_ids = [w for w in worker_ids if w in storing_workers]
     return [
         ObjectKey.ComputeKVRank(
             world_size=ipc_key.world_size,
@@ -563,6 +569,12 @@ class ShardReplicationDesc:
     ``w`` holding shard ``w % group_dcp_shards[g]``. Both tuples are indexed
     by object group and are empty when no group is replicated, the default.
 
+    Under pipeline parallelism a stage stores only the object groups of its
+    own layers: only the last stage holds a speculative drafter's KV.
+    ``group_storing_workers[g]`` names the workers that store group ``g``
+    (``None``: every worker), and a lookup skips the other workers' ranks.
+    It is empty when every worker stores every group, the default.
+
     Examples, for one chunk of object group ``0`` with 8 kv ranks:
 
     - ``ShardReplicationDesc()``: every rank holds its own shard. 8 objects, keyed
@@ -577,20 +589,25 @@ class ShardReplicationDesc:
     - ``ShardReplicationDesc((8, 1), (2, 1))``: a hybrid model whose object group
       ``1`` is head-sharded: group ``0`` as in the DCP=2 row, group ``1`` as
       in the first row.
+    - ``ShardReplicationDesc((1, 1), (1, 1), (None, frozenset({6, 7})))``:
+      PP4 x TP2 with a drafter on the last stage. Group ``0`` as in the first
+      row; group ``1`` has 2 objects, keyed by ranks 6 and 7.
     """
 
     group_tp_replicas: tuple[int, ...] = ()
     group_dcp_shards: tuple[int, ...] = ()
+    group_storing_workers: tuple[frozenset[int] | None, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.group_dcp_shards and len(self.group_dcp_shards) != len(
-            self.group_tp_replicas
+        for name, entries in (
+            ("group_dcp_shards", self.group_dcp_shards),
+            ("group_storing_workers", self.group_storing_workers),
         ):
-            raise ValueError(
-                f"ShardReplicationDesc: group_dcp_shards has "
-                f"{len(self.group_dcp_shards)} entries but group_tp_replicas "
-                f"has {len(self.group_tp_replicas)}"
-            )
+            if entries and len(entries) != len(self.group_tp_replicas):
+                raise ValueError(
+                    f"ShardReplicationDesc: {name} has {len(entries)} entries "
+                    f"but group_tp_replicas has {len(self.group_tp_replicas)}"
+                )
 
     @property
     def num_object_groups(self) -> int:
@@ -610,6 +627,12 @@ class ShardReplicationDesc:
         if not self.group_dcp_shards:
             return 1
         return self.group_dcp_shards[object_group_idx]
+
+    def storing_workers(self, object_group_idx: int) -> frozenset[int] | None:
+        """Worker ids that store the group; ``None`` when every worker does."""
+        if not self.group_storing_workers:
+            return None
+        return self.group_storing_workers[object_group_idx]
 
     def num_kv_readers(self, object_group_idx: int) -> int:
         """Workers that retrieve one object of the group: the ranks sharing
@@ -654,6 +677,8 @@ class GroupedObjectKeys:
             ``w`` chunks (``1`` for recurrent state).
         num_kv_readers: Read locks to take per object of this row -- one per
             reader that will retrieve it. Ignored under ``NO_LOCK``.
+        optional_window: Whether the row is optional: its absence never
+            shortens the hit (see ``fold_unfold_grouped``).
 
     Note:
         ``keys[i]`` is the object covering tokens
@@ -666,6 +691,7 @@ class GroupedObjectKeys:
     layout_desc: MemoryLayoutDesc
     sliding_window_size: int = FULL_ATTENTION_WINDOW_CHUNKS
     num_kv_readers: int = 1
+    optional_window: bool = False
 
     def __post_init__(self) -> None:
         if self.sliding_window_size == 0 or self.sliding_window_size < -1:
@@ -829,8 +855,8 @@ def ipc_key_to_object_keys(
 
     When the ipc_key's worker_id is None, each chunk hash is exploded into
     multiple ObjectKeys (one per worker in world_size, or one per token shard
-    per ``tp_replicas`` ranks for a replicated group; see
-    :func:`_lookup_kv_ranks`).
+    per ``tp_replicas`` ranks for a replicated group, skipping workers that do
+    not store the group; see :func:`_lookup_kv_ranks`).
 
     ``cache_salt`` is read directly from ``ipc_key`` so the produced
     ObjectKeys are per-user isolated whenever the sender set a non-empty
@@ -877,6 +903,7 @@ def ipc_key_to_object_keys(
                 ipc_key,
                 shard_replication_desc.tp_replicas(object_group_id),
                 shard_replication_desc.dcp_shards(object_group_id),
+                shard_replication_desc.storing_workers(object_group_id),
             )
         ]
         for object_group_id in object_group_ids
@@ -910,10 +937,12 @@ def ipc_key_to_grouped_object_keys(
         shard_replication_desc: How each object group is spread over the kv ranks; a
             replicated group yields one row per token shard per
             ``tp_replicas`` ranks, with ``num_kv_readers`` the ranks sharing
-            that shard.
+            that shard, and a group only some workers store yields rows for
+            their ranks only.
 
     Returns:
-        ``len(object_group_ids) * num_ranks`` rows, group-major / rank-minor.
+        One row per object group and kv rank that stores it, group-major /
+        rank-minor.
 
     Raises:
         ValueError: If an object group id has no layout in
@@ -949,6 +978,7 @@ def ipc_key_to_grouped_object_keys(
             ipc_key,
             shard_replication_desc.tp_replicas(object_group_id),
             shard_replication_desc.dcp_shards(object_group_id),
+            shard_replication_desc.storing_workers(object_group_id),
         ):
             rows.append(
                 GroupedObjectKeys(
@@ -968,6 +998,7 @@ def ipc_key_to_grouped_object_keys(
                     layout_desc=layout_desc,
                     sliding_window_size=window,
                     num_kv_readers=num_kv_readers,
+                    optional_window=attn_desc.is_optional_window(object_group_id),
                 )
             )
     return rows

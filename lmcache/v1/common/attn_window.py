@@ -32,6 +32,12 @@ class AttnWindowDesc:
     Empty when the producer predates kinds (treat every group as
     attention)."""
 
+    optional_window: tuple[bool, ...] = ()
+    """Per-group flags parallel to ``num_chunks_in_sw``. ``True`` marks a
+    sliding window the engine can recompute itself (vLLM prefix replay): its
+    absence never shortens a hit, and it is loaded only when present. Empty
+    means no group is optional."""
+
     _VALID_GROUP_KINDS = frozenset(get_args(GroupKind))
 
     def __post_init__(self) -> None:
@@ -55,11 +61,36 @@ class AttnWindowDesc:
             bad = set(self.group_kinds) - self._VALID_GROUP_KINDS
             if bad:
                 raise ValueError(f"AttnWindowDesc: unknown group kinds {bad!r}")
+        if self.optional_window:
+            if len(self.optional_window) != len(self.num_chunks_in_sw):
+                raise ValueError(
+                    f"AttnWindowDesc: optional_window has "
+                    f"{len(self.optional_window)} entries but num_chunks_in_sw "
+                    f"has {len(self.num_chunks_in_sw)}"
+                )
+            if all(self.optional_window):
+                raise ValueError("AttnWindowDesc: at least one group must be required")
+            pairs = zip(self.num_chunks_in_sw, self.optional_window, strict=True)
+            if any(w < 0 for w, opt in pairs if opt):
+                raise ValueError(
+                    "AttnWindowDesc: a full-attention group cannot be optional"
+                )
 
     @property
     def num_object_groups(self) -> int:
         """Number of object groups this descriptor covers."""
         return len(self.num_chunks_in_sw)
+
+    def is_optional_window(self, object_group_idx: int) -> bool:
+        """Whether the object group is optional (see ``optional_window``).
+
+        Args:
+            object_group_idx: 0-based object group index.
+
+        Returns:
+            True if a missing window of the group never shortens a hit.
+        """
+        return bool(self.optional_window) and self.optional_window[object_group_idx]
 
     def is_full_attention(self, object_group_idx: int) -> bool:
         """Whether the object group depends on the entire prefix.
