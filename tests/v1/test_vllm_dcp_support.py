@@ -512,3 +512,30 @@ def test_scratch_group_spans_zero_and_skips_alignment():
 
     assert get_group_tokens_per_block(config, kv_config) == [1600, 1600, 0]
     assert get_vllm_scheduler_block_size(config, kv_config) == 1600
+
+
+@requires_vllm
+def test_non_transferable_group_does_not_set_attention_block_sizes():
+    """Groups vLLM keeps private (enable_kv_transfer=False) must not widen
+    LMCache's hit-alignment set."""
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import (
+        get_resolved_attention_block_sizes,
+    )
+
+    kv_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_specs={"a": _attention_spec(256)},
+                enable_kv_transfer=True,
+            ),
+            SimpleNamespace(
+                kv_cache_specs={"b": _attention_spec(512)},
+                enable_kv_transfer=False,
+            ),
+        ]
+    )
+
+    sizes = get_resolved_attention_block_sizes(_geometry_config(), kv_config)
+
+    assert sizes == {256}

@@ -996,3 +996,36 @@ def test_ring_edit_needs_per_request_state(edits):
     edited = edits.apply_kv_cache_group_edits(config, {"ring.0": ring}, layout_hints={})
 
     assert edited["ring.0"] is ring
+
+
+@dataclass
+class _PerLayerGroup:
+    """vLLM after RFC #42449 part 2: one spec per layer."""
+
+    layer_names: list[str]
+    kv_cache_specs: dict[str, _Spec]
+    enable_kv_transfer: bool = True
+
+
+def test_validate_reads_per_layer_group_specs(edits):
+    group = _PerLayerGroup(["l"], {"l": _Spec(_SpecKind.MLA_ATTENTION, 16, 1024)})
+
+    edits.validate_kv_cache_groups(_Config([group]))
+
+
+def test_validate_skips_non_transferable_group(edits):
+    """A group vLLM does not publish for transfer is not LMCache's to serve."""
+    group = _PerLayerGroup(
+        ["l"],
+        {"l": _Spec(_SpecKind.CROSS_ATTENTION, 16, 1024)},
+        enable_kv_transfer=False,
+    )
+
+    edits.validate_kv_cache_groups(_Config([group]))
+
+
+def test_validate_rejects_transferable_cross_attention(edits):
+    group = _PerLayerGroup(["l"], {"l": _Spec(_SpecKind.CROSS_ATTENTION, 16, 1024)})
+
+    with pytest.raises(ValueError, match="CrossAttentionSpec"):
+        edits.validate_kv_cache_groups(_Config([group]))

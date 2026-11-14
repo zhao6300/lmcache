@@ -151,13 +151,19 @@ def test_blocked_roundtrip_value_exact_across_alignments(record):
     )
 
 
-def test_blocked_roundtrip_padded_pages():
-    """584-byte records in 19008-byte padded pages: the kernel must step blocks by the
-    real stride, not the tight block_size * row (every state past block 0 was wrong)."""
+@pytest.mark.parametrize(
+    ("row", "scale", "alignment"),
+    [(584, 8, 576), (528, 16, 1584)],
+    ids=["v4-584", "v4.1-footer-528"],
+)
+def test_blocked_roundtrip_padded_pages(row, scale, alignment):
+    """Padded pages: the kernel must step blocks by the real stride, not the
+    tight block_size * row (every state past block 0 was wrong). The V4.1
+    page is padded to the SWA block's 1584-byte alignment."""
     torch.manual_seed(1)
-    bs, row, scale = 32, 584, 8
+    bs = 32
     vals = row - scale
-    stride = ((bs * row + 575) // 576) * 576  # 19008
+    stride = ((bs * row + alignment - 1) // alignment) * alignment
     nb, nl, n_tok = 4, 2, 48
 
     def pages():

@@ -2,8 +2,9 @@
 """NL_X_NB_BSV_BSS through the torch fallback block transfer.
 
 A blocked-scale page stores, per block, all tokens' values and then all
-tokens' 4-byte scales, while LMCache chunk rows are token-major
-``[vals | scale]``. The torch fallback must repack between the two exactly as
+tokens' scales (4 B indexer fp32, 8 B V4, or 16 B V4.1 page-footer), while
+LMCache chunk rows are token-major ``[vals | scale]``. The torch fallback must
+repack between the two exactly as
 the CUDA kernels do (``tests/v1/multiprocess/test_blocked_scale_format.py``),
 rather than copying the page bytes as if they were token-major.
 """
@@ -23,7 +24,7 @@ _NB = 6
 _NL = 2
 # (value bytes, scale bytes) per token: the DSA indexer row and DeepSeek-V4's
 # packed main-KV row. Module globals are rebound per parametrization.
-_RECORDS = {68: (64, 4), 132: (128, 4), 584: (576, 8)}
+_RECORDS = {68: (64, 4), 132: (128, 4), 528: (512, 16), 584: (576, 8)}
 _VALS = 128
 _SCALE = 4
 _ROW = _VALS + _SCALE

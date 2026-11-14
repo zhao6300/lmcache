@@ -231,3 +231,66 @@ class TestPackedHeadSlotHints:
 
         assert "num_head_slots" not in hints
         assert "kv_head_major_slots" not in hints
+
+
+class TestFooterScaleHint:
+    def test_cake_backend_sets_the_blocked_scale_hint(self, monkeypatch):
+        # Third Party
+        import vllm.envs
+
+        monkeypatch.setattr(
+            vllm.envs, "VLLM_FLASHINFER_DSV41_SM120_CAKE", True, raising=False
+        )
+
+        hints = vllm_layout_hints(make_vllm_config("LBNHC"))
+
+        assert hints["blocked_scale"] is True
+
+    def test_default_backend_does_not_set_the_hint(self, monkeypatch):
+        # Third Party
+        import vllm.envs
+
+        monkeypatch.setattr(
+            vllm.envs, "VLLM_FLASHINFER_DSV41_SM120_CAKE", False, raising=False
+        )
+
+        assert "blocked_scale" not in vllm_layout_hints(make_vllm_config("LBNHC"))
+
+
+class TestPackedHeadSlotHintsEdgeCases:
+    def test_divergent_slot_counts_report_only_head_major(self):
+        groups = [
+            SimpleNamespace(
+                kv_cache_specs={
+                    "a": SimpleNamespace(num_head_slots=16, kv_head_major_slots=True)
+                },
+                enable_kv_transfer=True,
+            ),
+            SimpleNamespace(
+                kv_cache_specs={
+                    "b": SimpleNamespace(num_head_slots=8, kv_head_major_slots=False)
+                },
+                enable_kv_transfer=True,
+            ),
+        ]
+
+        hints = vllm_layout_hints(
+            make_vllm_config("LBNHC"),
+            SimpleNamespace(kv_cache_groups=groups),
+        )
+
+        assert "num_head_slots" not in hints
+        assert hints["kv_head_major_slots"] is True
+
+    def test_specs_without_slots_report_nothing(self):
+        group = SimpleNamespace(
+            kv_cache_specs={"a": SimpleNamespace()}, enable_kv_transfer=True
+        )
+
+        hints = vllm_layout_hints(
+            make_vllm_config("LBNHC"),
+            SimpleNamespace(kv_cache_groups=[group]),
+        )
+
+        assert "num_head_slots" not in hints
+        assert "kv_head_major_slots" not in hints
