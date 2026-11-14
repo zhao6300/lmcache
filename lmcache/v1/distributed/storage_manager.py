@@ -157,6 +157,10 @@ class StorageManager:
 
             self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
             self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
+            # The L1 topology is fixed at startup, so this never changes.
+            self._numa_aware = any(
+                m.config.memory_config.numa_node is not None for m in self._l1_managers
+            )
 
             self._write_policy = create_write_policy(config.write_policy)
 
@@ -1363,9 +1367,7 @@ class StorageManager:
 
         Callers use it to run the thread that serves a GPU on that GPU's node.
         """
-        return any(
-            m.config.memory_config.numa_node is not None for m in self._l1_managers
-        )
+        return self._numa_aware
 
     def report_status(self) -> dict:
         """Return per-L1 status and aggregate health; retain single-L1 field names."""
