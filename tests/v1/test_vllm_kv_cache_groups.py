@@ -105,6 +105,73 @@ class MockProjectedKVCacheGroup:
     enable_kv_transfer: bool = True
 
 
+class SlidingWindowManager:
+    """Double of vLLM's allocation policy; detected by class name."""
+
+
+class FullAttentionManager:
+    """Double of vLLM's full-attention allocation policy."""
+
+
+@dataclass
+class MockManagerParams:
+    sliding_window: int = 0
+    bounded_replay: bool = False
+
+
+@dataclass
+class MockManagerConfig:
+    manager_cls: type
+    params: object
+
+
+@dataclass
+class MockManagedKVCacheGroup:
+    """vLLM after RFC #42449 part 3: the allocation policy is on the group, the
+    spec carries neither the window nor the prefix-caching marker."""
+
+    layer_names: list[str]
+    kv_cache_specs: "dict[str, object]"
+    manager_config: object
+    prefix_cacheable: bool = True
+    prefix_replay_tokens: int = 0
+    enable_kv_transfer: bool = True
+
+
+@dataclass
+class MirroredReplaySpec(AttentionSpec):
+    """The DeepSeek-V4.1 fork mirrors the replay window onto the spec."""
+
+    prefix_replay_tokens: int = 0
+
+
+def _full_group(names: list[str], block_size: int = 16) -> MockManagedKVCacheGroup:
+    return MockManagedKVCacheGroup(
+        names,
+        {n: AttentionSpec(block_size=block_size) for n in names},
+        MockManagerConfig(FullAttentionManager, MockManagerParams()),
+    )
+
+
+def _window_group(
+    names: list[str], window: int, *, replay: bool, block_size: int = 16
+) -> MockManagedKVCacheGroup:
+    return MockManagedKVCacheGroup(
+        names,
+        {
+            n: MirroredReplaySpec(
+                block_size=block_size, prefix_replay_tokens=window if replay else 0
+            )
+            for n in names
+        },
+        MockManagerConfig(
+            SlidingWindowManager, MockManagerParams(window, bounded_replay=replay)
+        ),
+        prefix_cacheable=not replay,
+        prefix_replay_tokens=window if replay else 0,
+    )
+
+
 @dataclass
 class MockKVCacheConfig:
     kv_cache_groups: list[MockKVCacheGroup]
@@ -1029,3 +1096,176 @@ def test_connector_geometry_counts_a_group_the_stage_holds_no_layers_of():
         64,
         32,
     }
+
+
+def test_conversion_reads_the_window_from_the_group_manager():
+    """A sliding-window group has no window on its spec any more: it is the
+    manager's parameter, so a spec-only reading takes it for full attention."""
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                _full_group(["layer.0"]),
+                _window_group(["layer.1"], 8, replay=False),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [group.sw_size_tokens for group in infos] == [-1, 8]
+    assert [group.prefix_replay for group in infos] == [False, False]
+
+
+@pytest.mark.parametrize(
+    "store_windows,engine_groups,prefix_replay",
+    [(False, [0], [False]), (True, [0, 1], [False, True])],
+    ids=["off", "on"],
+)
+def test_conversion_registers_replay_groups_by_the_group_marker(
+    store_windows: bool, engine_groups: list[int], prefix_replay: list[bool]
+):
+    """vLLM marks a replayed window on the group, not the spec: it is scratch
+    unless the connector stores windows, and then it keeps its window."""
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                _full_group(["layer.0"]),
+                _window_group(["layer.1"], 128, replay=True),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+        store_replay_windows=store_windows,
+    )
+
+    assert [group.engine_group_id for group in infos] == engine_groups
+    assert [group.prefix_replay for group in infos] == prefix_replay
+    if store_windows:
+        assert infos[1].sw_size_tokens == 128
+
+
+def test_server_accepts_the_replay_groups_a_connector_registers():
+    """The server builds its attention windows from the registered groups: a
+    replay group has to carry its window, or it is a full-attention group that
+    cannot be optional ("a full-attention group cannot be optional")."""
+    # First Party
+    from lmcache.utils import EngineType
+    from lmcache.v1.common.utils import normalize_and_discover_per_layer_formats
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+
+    caches = _same_shape_caches(["layer.0", "layer.1", "layer.2"])
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                _full_group(["layer.0"]),
+                _window_group(["layer.1", "layer.2"], 128, replay=True),
+            ]
+        ),
+        caches,
+        store_replay_windows=True,
+    )
+    normalized, formats = normalize_and_discover_per_layer_formats(
+        list(caches.values()), [], EngineType.VLLM
+    )
+    manager = KVLayerGroupsManager(
+        normalized,
+        engine_kv_formats=formats,
+        engine_group_infos=infos,
+        lmcache_tokens_per_chunk=256,
+    )
+
+    desc = manager.get_attn_desc()
+
+    assert desc.optional_window == (False, True)
+    assert desc.num_chunks_in_sw == [-1, 1]
+
+
+def test_connector_reads_replay_and_scratch_from_the_group():
+    pytest.importorskip("vllm")
+    # First Party
+    from lmcache.integration.vllm import lmcache_mp_connector as module
+
+    config = MockKVCacheConfig(
+        kv_cache_groups=[
+            _full_group(["layer.0"], block_size=64),
+            _window_group(["layer.1"], 128, replay=True, block_size=32),
+        ]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+
+    assert module.get_prefix_replay_tokens(config) == 128
+    assert module.get_group_tokens_per_block(vllm_config, config) == [64, 0]
+    assert module.get_group_tokens_per_block(
+        vllm_config, config, store_replay_windows=True
+    ) == [64, 32]
+    assert module.get_resolved_attention_block_sizes(vllm_config, config) == {64}
+    assert module.get_resolved_attention_block_sizes(
+        vllm_config, config, store_replay_windows=True
+    ) == {64, 32}
+
+
+def test_conversion_reads_real_vllm_groups():
+    """vLLM's own group objects, for a build whose groups carry their
+    allocation policy: the replayed window, the window of a compressor-state
+    group, and a group a pipeline stage holds no layers of."""
+    manager_module = pytest.importorskip("vllm.v1.core.single_type_kv_cache_manager")
+    interface = pytest.importorskip("vllm.v1.kv_cache_interface")
+    if not hasattr(manager_module.SlidingWindowManager, "layer_config"):
+        pytest.skip("vLLM keeps the sliding window on the KV cache spec")
+    # Standard
+    from dataclasses import replace
+
+    # First Party
+    from lmcache.integration.vllm.kv_cache_groups import (
+        get_group_prefix_replay_tokens,
+        get_group_sliding_window,
+        is_scratch_group,
+    )
+
+    def spec(block_size: int):
+        return interface.MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+        )
+
+    sliding = manager_module.SlidingWindowManager
+    full = interface.KVCacheGroup.from_layers(
+        {"layer.0": manager_module.FullAttentionManager.layer_config(spec(64))}
+    )
+    replayed = interface.KVCacheGroup.from_layers(
+        {
+            name: sliding.layer_config(
+                spec(32), sliding_window=128, bounded_replay=True
+            )
+            for name in ("layer.1", "layer.2")
+        }
+    )
+    compressor = interface.KVCacheGroup.from_layers(
+        {"layer.3": sliding.layer_config(spec(32), sliding_window=8)}
+    )
+    other_stage = replace(
+        replayed, kv_cache_specs={}, unprojected_specs=replayed.distinct_specs
+    )
+
+    assert not is_scratch_group(full)
+    assert is_scratch_group(replayed)
+    assert not is_scratch_group(replayed, store_replay_windows=True)
+    assert get_group_prefix_replay_tokens(replayed) == 128
+    assert get_group_sliding_window(compressor) == 8
+    # A stage without the group's layers sees the same group.
+    assert is_scratch_group(other_stage)
+    assert get_group_sliding_window(other_stage) == 128
+
+    caches = _same_shape_caches(["layer.0", "layer.1", "layer.2", "layer.3"])
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(kv_cache_groups=[full, replayed, compressor]),
+        caches,
+        store_replay_windows=True,
+    )
+    assert [
+        (g.engine_group_id, g.tokens_per_block, g.sw_size_tokens, g.prefix_replay)
+        for g in infos
+    ] == [(0, 64, -1, False), (1, 32, 128, True), (2, 32, 8, False)]

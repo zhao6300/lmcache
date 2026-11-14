@@ -69,12 +69,12 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     get_group_kv_cache_spec,
+    get_group_prefix_replay_tokens,
     get_tokens_per_block,
-    has_prefix_replay,
     is_align_mode_mamba_spec,
-    is_transferable_group,
     is_per_request_state_spec,
-    is_scratch_spec,
+    is_scratch_group,
+    is_transferable_group,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
 from lmcache.integration.vllm.lmcache_mp_metadata import (
@@ -337,8 +337,11 @@ def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     return False
 
 
-def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[Any]:
-    """Yield leaf KV cache specs without depending on a vLLM helper API."""
+def _iter_group_specs(
+    kv_cache_config: "KVCacheConfig | None",
+) -> Iterable[tuple[Any, Any]]:
+    """Yield each transferable group with its leaf KV cache specs, without
+    depending on a vLLM helper API."""
     if kv_cache_config is None:
         return
     for group in kv_cache_config.kv_cache_groups:
@@ -346,19 +349,28 @@ def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[An
             continue
         per_layer_specs = getattr(group, "kv_cache_specs", None)
         if isinstance(per_layer_specs, dict) and per_layer_specs:
-            yield from per_layer_specs.values()
+            for spec in per_layer_specs.values():
+                yield group, spec
             continue
         # A group projected onto a pipeline stage can hold none of its layers.
         distinct_specs = getattr(group, "distinct_specs", None)
         if distinct_specs:
-            yield from distinct_specs
+            for spec in distinct_specs:
+                yield group, spec
             continue
         group_spec = getattr(group, "kv_cache_spec", None)
         inner = getattr(group_spec, "kv_cache_specs", None)
         if isinstance(inner, dict) and inner:
-            yield from inner.values()
+            for spec in inner.values():
+                yield group, spec
         else:
-            yield group_spec
+            yield group, group_spec
+
+
+def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[Any]:
+    """Yield leaf KV cache specs without depending on a vLLM helper API."""
+    for _, spec in _iter_group_specs(kv_cache_config):
+        yield spec
 
 
 def get_group_tokens_per_block(
@@ -396,6 +408,7 @@ def get_group_tokens_per_block(
             get_group_kv_cache_spec(group),
             dcp_size,
             store_replay_windows=store_replay_windows,
+            scratch=is_scratch_group(group, store_replay_windows=store_replay_windows),
         )
         for group in groups
     ] or [vllm_config.cache_config.block_size * dcp_size]
@@ -414,16 +427,7 @@ def get_prefix_replay_tokens(kv_cache_config: "KVCacheConfig | None") -> int:
         else ()
     )
     return max(
-        (
-            int(
-                getattr(
-                    get_group_kv_cache_spec(group), "prefix_replay_tokens", 0
-                )
-                or 0
-            )
-            for group in groups
-        ),
-        default=0,
+        (get_group_prefix_replay_tokens(group) for group in groups), default=0
     )
 
 
@@ -565,9 +569,9 @@ def get_resolved_attention_block_sizes(
     """
     block_sizes = {
         spec.block_size
-        for spec in _iter_kv_cache_specs(kv_cache_config)
+        for group, spec in _iter_group_specs(kv_cache_config)
         if any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
-        and not is_scratch_spec(spec, store_replay_windows=store_replay_windows)
+        and not is_scratch_group(group, store_replay_windows=store_replay_windows)
     }
     if block_sizes:
         return block_sizes
@@ -838,7 +842,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 for group_id, group in enumerate(
                     getattr(kv_cache_config, "kv_cache_groups", ()) or ()
                 )
-                if has_prefix_replay(get_group_kv_cache_spec(group))
+                if get_group_prefix_replay_tokens(group) > 0
             )
             if self._store_replay_windows
             else ()

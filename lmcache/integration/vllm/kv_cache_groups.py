@@ -169,6 +169,78 @@ def get_group_kv_cache_spec(group: Any) -> Any:
     return getattr(group, "kv_cache_spec", None)
 
 
+def get_group_prefix_replay_tokens(group: Any) -> int:
+    """Return the tokens vLLM recomputes after a hit to rebuild the group's window.
+
+    vLLM after RFC #42449 derives it from the group's allocation policy
+    (``KVCacheGroup.prefix_replay_tokens``); a spec may mirror it
+    (``prefix_replay_tokens``), and older vLLM only has the spec's value.
+
+    Args:
+        group: A vLLM ``KVCacheGroup`` (either interface generation).
+
+    Returns:
+        The replay window in tokens, ``0`` for a group that is not replayed.
+    """
+    tokens = getattr(group, "prefix_replay_tokens", None)
+    if isinstance(tokens, int):
+        return tokens
+    return int(
+        getattr(_leaf_spec(get_group_kv_cache_spec(group)), "prefix_replay_tokens", 0)
+        or 0
+    )
+
+
+def get_group_sliding_window(group: Any) -> int:
+    """Return the sliding window of a group vLLM allocates as a sliding window.
+
+    vLLM after RFC #42449 keeps no window on the spec: it is the
+    ``sliding_window`` of the group's ``SlidingWindowManager`` parameters
+    (``KVCacheGroup.manager_config``). Older vLLM reads it off the spec instead,
+    which :func:`_resolve_per_layer_sw_sizes` handles.
+
+    Args:
+        group: A vLLM ``KVCacheGroup`` (either interface generation).
+
+    Returns:
+        The window in tokens, or ``-1`` when the group is not a sliding window.
+    """
+    config = getattr(group, "manager_config", None)
+    manager_cls = getattr(config, "manager_cls", None)
+    if not any(
+        cls.__name__ == "SlidingWindowManager"
+        for cls in getattr(manager_cls, "__mro__", ())
+    ):
+        return -1
+    window = getattr(getattr(config, "params", None), "sliding_window", None)
+    return int(window) if isinstance(window, int) and window > 0 else -1
+
+
+def is_scratch_group(group: Any, *, store_replay_windows: bool = False) -> bool:
+    """Return whether vLLM keeps the group out of prefix caching.
+
+    vLLM after RFC #42449 decides it per group, from its allocation policy
+    (``KVCacheGroup.prefix_cacheable``); the spec carries no marker any more.
+    Older vLLM marks it on the spec, which :func:`is_scratch_spec` reads.
+
+    Args:
+        group: A vLLM ``KVCacheGroup`` (either interface generation).
+        store_replay_windows: Treat a group whose window vLLM replays as
+            storable rather than scratch (see :func:`is_scratch_spec`).
+
+    Returns:
+        ``True`` for a scratch group.
+    """
+    if store_replay_windows and get_group_prefix_replay_tokens(group) > 0:
+        return False
+    prefix_cacheable = getattr(group, "prefix_cacheable", None)
+    if isinstance(prefix_cacheable, bool):
+        return not prefix_cacheable
+    return is_scratch_spec(
+        get_group_kv_cache_spec(group), store_replay_windows=store_replay_windows
+    )
+
+
 def get_layer_kv_cache_spec(group: Any, layer_name: str) -> Any:
     """Return ``layer_name``'s KV cache spec from a vLLM cache group.
 
@@ -194,7 +266,11 @@ def get_layer_kv_cache_spec(group: Any, layer_name: str) -> Any:
 
 
 def get_tokens_per_block(
-    kv_cache_spec: Any, dcp_size: int, *, store_replay_windows: bool = False
+    kv_cache_spec: Any,
+    dcp_size: int,
+    *,
+    store_replay_windows: bool = False,
+    scratch: bool | None = None,
 ) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
@@ -203,8 +279,16 @@ def get_tokens_per_block(
     replicated, not sharded, and stays at ``block_size``. Scratch specs
     (see :func:`is_scratch_spec`, which also defines
     ``store_replay_windows``) cover no tokens and yield ``0``.
+
+    ``scratch`` is the caller's answer from :func:`is_scratch_group`, for vLLM
+    builds that keep it on the group's manager rather than on the spec; when
+    ``None`` the spec decides.
     """
-    if is_scratch_spec(kv_cache_spec, store_replay_windows=store_replay_windows):
+    if scratch is None:
+        scratch = is_scratch_spec(
+            kv_cache_spec, store_replay_windows=store_replay_windows
+        )
+    if scratch:
         return 0
     block_size = kv_cache_spec.block_size
     if dcp_size <= 1:
@@ -281,12 +365,15 @@ def _resolve_per_layer_sw_sizes(
     """
     per_layer_sw_size = [-1] * num_layers
     for group in vllm_groups:
+        group_window = get_group_sliding_window(group)
         for name in group.layer_names:
             layer_spec = get_layer_kv_cache_spec(group, name)
             if layer_spec is None:
                 continue
             if _is_sliding_window_spec(layer_spec):
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.sliding_window
+            elif group_window > 0:
+                per_layer_sw_size[layer_to_idx[name]] = group_window
             elif _is_cachable_mamba_spec(layer_spec):
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.block_size
     return per_layer_sw_size
@@ -534,10 +621,7 @@ def create_engine_group_infos_from_vllm(
         for group in vllm_groups
         if is_transferable_group(group)
         and (
-            not is_scratch_spec(
-                get_group_kv_cache_spec(group),
-                store_replay_windows=store_replay_windows,
-            )
+            not is_scratch_group(group, store_replay_windows=store_replay_windows)
             or is_registered_per_request_state(get_group_kv_cache_spec(group))
         )
     ]
@@ -568,7 +652,7 @@ def create_engine_group_infos_from_vllm(
     replay_engine_groups = {
         engine_group_id
         for engine_group_id, group in enumerate(vllm_groups)
-        if store_replay_windows and has_prefix_replay(get_group_kv_cache_spec(group))
+        if store_replay_windows and get_group_prefix_replay_tokens(group) > 0
     }
     if vllm_groups:
         per_layer_group_idx = [EXCLUDED_ENGINE_GROUP] * num_layers
@@ -584,6 +668,9 @@ def create_engine_group_infos_from_vllm(
                 group_spec,
                 dcp_size,
                 store_replay_windows=store_replay_windows,
+                scratch=is_scratch_group(
+                    group, store_replay_windows=store_replay_windows
+                ),
             )
             if is_registered_per_request_state(group_spec):
                 per_request_state_groups.add(engine_group_id)
