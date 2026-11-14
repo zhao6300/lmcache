@@ -214,3 +214,45 @@ def test_vllm_tuple_equal_widths_stays_kv_pair():
     kv = [(_t(NB, BS, 1, HS), _t(NB, BS, 1, HS)) for _ in range(NL)]
     fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
     assert fmt == F.NL_X_TWO_X_NB_BS_NH_HS
+
+
+def test_vllm_blocked_scale_528_needs_the_footer_hint():
+    """A 528-byte V4.1 record is per-token by default; only the page-footer
+    (SM120 cake) form is a blocked-scale page."""
+    kv = [torch.zeros(NB, BS, 528, dtype=torch.uint8) for _ in range(NL)]
+
+    fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+    assert fmt == F.NL_X_NB_BS_HS
+
+    fmt, _ = detect_format(
+        kv, EngineType.VLLM, {"kv_layout": "NHD", "blocked_scale": True}
+    )
+    assert fmt == F.NL_X_NB_BSV_BSS
+
+
+@pytest.mark.parametrize("row", [68, 132, 584])
+def test_vllm_blocked_scale_rows_are_self_identifying(row):
+    """Indexer and V4 main-KV rows identify their blocked-scale layout by
+    width, with no engine hint."""
+    kv = [torch.zeros(NB, BS, row, dtype=torch.uint8) for _ in range(NL)]
+
+    fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+    assert fmt == F.NL_X_NB_BSV_BSS
+
+
+def test_vllm_packed_head_slots_match_the_registered_view():
+    """Packed head slots are the logical H axis and transfer as opaque rows."""
+    slots, hs = 8, 64
+    kv = [torch.zeros(NB, BS, slots, hs, dtype=DT) for _ in range(NL)]
+
+    fmt, _ = detect_format(
+        kv, EngineType.VLLM, {"kv_layout": "NHD", "num_head_slots": slots}
+    )
+    assert fmt == F.NL_X_NB_BS_NH_CS
+
+
+def test_vllm_packed_head_slot_mismatch_fails_loudly():
+    kv = [torch.zeros(NB, BS, 8, 64, dtype=DT) for _ in range(NL)]
+
+    with pytest.raises(ValueError, match="num_head_slots=16"):
+        detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD", "num_head_slots": 16})

@@ -33,13 +33,74 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
-def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
-    """Build layout_hints dict by querying vLLM at runtime."""
-    hints: dict[str, str] = {}
+def vllm_layout_hints(
+    vllm_config: "VllmConfig | None" = None,
+    kv_cache_config: object | None = None,
+) -> "LayoutHints":
+    """Build layout_hints dict by querying vLLM at runtime.
+
+    Args:
+        vllm_config: The engine config; ambient config when omitted.
+        kv_cache_config: vLLM's resolved cache groups, when available. Used to
+            report packed head slots (``num_head_slots`` /
+            ``kv_head_major_slots``) so format detection can validate the
+            registered view.
+    """
+    hints: dict[str, Any] = {}
     kv_layout = try_get_vllm_kv_cache_layout(vllm_config)
     if kv_layout is not None:
         hints["kv_layout"] = kv_layout
+    if try_get_vllm_footer_scale():
+        hints["blocked_scale"] = True
+    hints.update(_packed_head_slot_hints(kv_cache_config))
     return hints  # type: ignore[return-value]
+
+
+def _packed_head_slot_hints(kv_cache_config: object | None) -> dict[str, Any]:
+    """Report the packed head-slot shape of the transferable groups."""
+    if kv_cache_config is None:
+        return {}
+    # First Party
+    from lmcache.integration.vllm.kv_cache_groups import (
+        get_group_kv_cache_spec,
+        is_transferable_group,
+    )
+
+    slots: set[int] = set()
+    head_major = False
+    for group in getattr(kv_cache_config, "kv_cache_groups", ()) or ():
+        if not is_transferable_group(group):
+            continue
+        spec = get_group_kv_cache_spec(group)
+        num_slots = getattr(spec, "num_head_slots", None)
+        if num_slots is not None:
+            slots.add(int(num_slots))
+        head_major = head_major or bool(getattr(spec, "kv_head_major_slots", False))
+    hints: dict[str, Any] = {}
+    if len(slots) == 1:
+        hints["num_head_slots"] = slots.pop()
+    elif slots:
+        # Different groups pack different slot counts; the per-layer tensor
+        # shape stays authoritative, so only the ordering hint is useful.
+        pass
+    if head_major:
+        hints["kv_head_major_slots"] = True
+    return hints
+
+
+def try_get_vllm_footer_scale() -> bool:
+    """Return whether vLLM writes DeepSeek-V4.1 page-footer scale records.
+
+    FlashInfer's SM120 ``cake`` backend stores a page's scales after its value
+    rows instead of inline per token. The layout has the same per-token width
+    (528 B), so only the engine can tell LMCache which form it allocated.
+    """
+    try:
+        # Third Party
+        from vllm import envs
+    except Exception:
+        return False
+    return bool(getattr(envs, "VLLM_FLASHINFER_DSV41_SM120_CAKE", False))
 
 
 def translate_vllm_kv_cache_layout(kv_cache_layout: str) -> KVLayoutName:

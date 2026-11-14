@@ -85,6 +85,15 @@ class MockKVCacheGroup:
 
 
 @dataclass
+class MockPerLayerKVCacheGroup:
+    """vLLM after RFC #42449 part 2: one spec per layer, plus the transfer flag."""
+
+    layer_names: list[str]
+    kv_cache_specs: "dict[str, object]"
+    enable_kv_transfer: bool = True
+
+
+@dataclass
 class MockKVCacheConfig:
     kv_cache_groups: list[MockKVCacheGroup]
 
@@ -236,6 +245,69 @@ def test_conversion_defaults_sliding_window_for_non_sw_spec():
     )
 
     assert [group.sw_size_tokens for group in spec] == [-1]
+
+
+def test_conversion_reads_per_layer_group_specs():
+    """The newest vLLM KVCacheGroup stores one spec per layer; the group is
+    read through those specs instead of a single group-level ``kv_cache_spec``.
+    """
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockPerLayerKVCacheGroup(
+                    ["layer.0", "layer.1"],
+                    {
+                        "layer.0": FullAttentionSpec(block_size=16),
+                        "layer.1": MockKVCacheSpec(block_size=16),
+                    },
+                )
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [group.layer_indices for group in spec] == [(0, 1)]
+    assert [group.tokens_per_block for group in spec] == [16]
+    assert [group.sw_size_tokens for group in spec] == [-1]
+
+
+def test_conversion_reads_per_layer_mamba_spec():
+    """A per-layer Mamba spec still resolves to a one-block recurrent window."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockPerLayerKVCacheGroup(
+                    ["layer.0"], {"layer.0": MambaSpec(block_size=16)}
+                )
+            ]
+        ),
+        _same_shape_caches(["layer.0"]),
+    )
+
+    assert [group.sw_size_tokens for group in spec] == [16]
+
+
+def test_conversion_excludes_non_transferable_group():
+    """vLLM marks ephemeral replicas with enable_kv_transfer=False; LMCache
+    must not form a group for them."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockPerLayerKVCacheGroup(
+                    ["layer.0"], {"layer.0": MockKVCacheSpec(block_size=16)}
+                ),
+                MockPerLayerKVCacheGroup(
+                    ["layer.1"],
+                    {"layer.1": MockKVCacheSpec(block_size=16)},
+                    enable_kv_transfer=False,
+                ),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [group.layer_indices for group in spec] == [(0,)]
+    assert get_engine_group_indices(spec, 2) == [0, -1]
 
 
 def test_conversion_resolves_mamba_align_window():

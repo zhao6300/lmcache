@@ -51,11 +51,31 @@ class LayoutHints(TypedDict, total=False):
     num_kv_heads: int
     tokens_per_block: int
     head_dim: int
+    blocked_scale: bool
+    """The engine wrote blocked-scale pages whose row width is ambiguous.
+
+    A 528-byte DeepSeek-V4.1 record is per-token by default and page-footer
+    (``[BS x values][BS x scales]``) only under the SM120 ``cake`` backend.
+    Set when the engine selected the footer form.
+    """
+
+    num_head_slots: int
+    """Head slots the engine packs into each stored state (vLLM
+    ``AttentionSpec.num_head_slots``); absent means one slot per KV head."""
+
+    kv_head_major_slots: bool
+    """Whether the packed head slots are grouped by KV head (``H2ND``): head
+    ``h``'s K and V slots are adjacent. The slots still form one contiguous
+    run per token, so the whole token row is transferred as opaque bytes."""
 
 
-# uint8 rows vLLM pages as [BS x values][BS x scales] (NL_X_NB_BSV_BSS): fp8 / MXFP4
-# indexer K and the DeepSeek-V4 SM90 main KV. The per-token scale is one transfer word.
-BLOCKED_SCALE_ROWS: frozenset[int] = frozenset({132, 68, 584})
+# uint8 rows vLLM pages as [BS x values][BS x scales] (NL_X_NB_BSV_BSS):
+# fp8 / MXFP4 indexer K, the DeepSeek-V4 SM90 main KV (8 B scales) and the
+# DeepSeek-V4.1 SM100/120 page-footer record (16 B of UE8M0 scales). The value
+# is the per-token scale width in bytes; the native kernels mirror this table
+# in ``csrc/engine_kv_format.h``.
+BLOCKED_SCALE_BYTES: dict[int, int] = {132: 4, 68: 4, 584: 8, 528: 16}
+BLOCKED_SCALE_ROWS: frozenset[int] = frozenset(BLOCKED_SCALE_BYTES)
 
 
 def transfer_word_bytes(row_bytes: int) -> int:
@@ -64,6 +84,11 @@ def transfer_word_bytes(row_bytes: int) -> int:
         if row_bytes % word == 0:
             return word
     return 1
+
+
+def scale_bytes_for_row(row_bytes: int) -> int | None:
+    """Return the per-token scale width of a blocked-scale row, or ``None``."""
+    return BLOCKED_SCALE_BYTES.get(int(row_bytes))
 
 
 def is_blocked_scale_row(row_bytes: int) -> bool:

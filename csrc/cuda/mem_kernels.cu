@@ -215,7 +215,8 @@ __device__ __forceinline__ int64_t
 page_buffer_offset(const int k_or_v, const int token_idx,
                    const int scalar_offset, const int scalars_per_token,
                    const int page_buffer_size, const int block_size,
-                   const int head_size, const int64_t block_stride_xwords) {
+                   const int head_size, const int64_t block_stride_xwords,
+                   const int scalar_size) {
   /*
   logical semantics of arguments (agnostic to physical format):
   k_or_v:            0 for key, 1 for value
@@ -230,6 +231,8 @@ page_buffer_offset(const int k_or_v, const int token_idx,
   block_stride_xwords: physical per-block step (xword units) — only used by
   blocks-first cross-layer formats, whose block step spans every layer's
   bytes (and, in HMA-shared pools, other groups' bytes too)
+  scalar_size:        sizeof the kernel's transfer word in bytes — used by
+  blocked-scale records to size the per-token scale region
 
   The job of page_buffer_offset is to translate these logical arguments into a
   physical address based on the EngineKVFormat.
@@ -320,12 +323,14 @@ page_buffer_offset(const int k_or_v, const int token_idx,
            static_cast<int64_t>(block_offset) * scalars_per_token +
            scalar_offset;
   }
-  // Blocked scales: page [BSxvals][BSxscales]; the scale is one xword (4 B
-  // for the DSA indexer, 8 B for the DeepSeek-V4 main KV record).
+  // Blocked scales: page [BSxvals][BSxscales]; the scale width comes from the
+  // record table (4 B indexer fp32, 8 B V4 UE8M0, 16 B V4.1 page-footer).
   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     const int64_t block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
-    const int vals = scalars_per_token - 1;
+    const int row_bytes = scalars_per_token * scalar_size;
+    const int scale_units = blocked_scale_bytes_for_row(row_bytes) / scalar_size;
+    const int vals = scalars_per_token - scale_units;
     // Padded pages / shared physical blocks pass the real per-block step; 0 =
     // tight.
     const int64_t block_step =
@@ -337,7 +342,9 @@ page_buffer_offset(const int k_or_v, const int token_idx,
       return block_base + static_cast<int64_t>(block_offset) * vals +
              scalar_offset;
     }
-    return block_base + static_cast<int64_t>(block_size) * vals + block_offset;
+    return block_base + static_cast<int64_t>(block_size) * vals +
+           static_cast<int64_t>(block_offset) * scale_units +
+           (scalar_offset - vals);
   }
 }
 
@@ -405,7 +412,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
                          num_tokens, num_layers);
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, sizeof(scalar_t));
     if (DIRECTION)
       chunk.key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
     else
@@ -456,7 +463,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
 
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, sizeof(scalar_t));
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];

@@ -261,11 +261,15 @@ __device__ void multi_layer_block_transfer_single_block(
 
   if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     // Blocked page [BSxvals][BSxscales] vs token-major chunk row: two
-    // copies per token. The per-token scale is exactly one transfer word
-    // (4 B fp32 for the DSA indexer, 8 B of UE8M0 for the DeepSeek-V4 main
-    // KV); the launcher picks the word so this holds.
+    // copies per token. The per-token scale width comes from the record table
+    // (4 B indexer fp32, 8 B V4 UE8M0, 16 B V4.1 page-footer UE8M0).
+    const size_t head_bytes =
+        static_cast<size_t>(shape_desc.hs * shape_desc.element_size);
     const size_t spt = shape_desc.scalars_per_token<ScalarType>();
-    const size_t scale_units = 1;
+    const size_t scale_units =
+        static_cast<size_t>(blocked_scale_bytes_for_row(
+            static_cast<int>(head_bytes))) /
+        sizeof(ScalarType);
     const size_t val_units = spt - scale_units;
     for (int t = init_token_offset; t < shape_desc.bs; t += token_stride) {
       ScalarType* eng_vals =
@@ -470,13 +474,18 @@ void dispatch_by_transfer_unit(const PageBufferShapeDesc& shape_desc,
               head_bytes, ") must be divisible by 2 for vectorized access");
 
   if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
-    // Blocked-scale records store the per-token scale as one transfer word, so
-    // pick the widest of 8/4 bytes dividing the row: 584-byte V4 records carry
-    // 8 B of UE8M0 scales, 132/68-byte indexer rows an fp32.
-    TORCH_CHECK(head_bytes % sizeof(uint32_t) == 0,
+    // Blocked-scale records store the per-token scale as a whole number of
+    // transfer words. Pick the widest word (8 or 4 bytes) dividing both the
+    // row and the scale: 8 B V4 / 16 B V4.1 UE8M0 scales use 8-byte words,
+    // 132/68-byte indexer rows with an fp32 scale use 4-byte words.
+    const int scale_bytes = blocked_scale_bytes_for_row(head_bytes);
+    TORCH_CHECK(head_bytes % sizeof(uint32_t) == 0 &&
+                    scale_bytes % sizeof(uint32_t) == 0,
                 "NL_X_NB_BSV_BSS row bytes (", head_bytes,
+                ") and scale bytes (", scale_bytes,
                 ") must be divisible by 4");
-    if (head_bytes % sizeof(uint64_t) == 0) {
+    if (head_bytes % sizeof(uint64_t) == 0 &&
+        scale_bytes % sizeof(uint64_t) == 0) {
       fn(TransferUnit<uint64_t>{});
     } else {
       fn(TransferUnit<uint32_t>{});

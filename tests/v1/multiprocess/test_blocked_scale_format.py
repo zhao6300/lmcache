@@ -35,7 +35,7 @@ _NL = 3
 # (value bytes, scale bytes) per token: the fp8 DSA indexer row (fp32 scale,
 # 4-byte transfer word) and DeepSeek-V4's packed main KV on SM90 (8 B of UE8M0
 # scales, 8-byte transfer word). Module globals are rebound per record.
-_RECORDS = {68: (64, 4), 132: (128, 4), 584: (576, 8)}
+_RECORDS = {68: (64, 4), 132: (128, 4), 528: (512, 16), 584: (576, 8)}
 _HD = 128
 _SC = 4
 _ROW = _HD + _SC
@@ -241,16 +241,22 @@ def test_blocked_roundtrip_padded_pages():
     assert torch.equal(got, rows)
 
 
-def test_batched_block_transfer_584_records_live_geometry():
-    """The batched store/retrieve kernel on DeepSeek-V4.1's live geometry: three
-    ratio-2 layer pages (584 B x 32 states) interleaved in one 116928-byte
-    engine-group block. The per-token scale is 8 bytes (one 8-byte transfer
-    word), not the indexer's 4-byte fp32 — a 4-byte word drifts every record."""
+@pytest.mark.parametrize(
+    ("row", "scale"),
+    [(584, 8), (528, 16)],
+    ids=["v4-584", "v4.1-footer-528"],
+)
+def test_batched_block_transfer_live_geometry(row, scale):
+    """The batched store/retrieve kernel on DeepSeek's live geometry: three
+    layer pages interleaved in one engine-group block. The V4 page carries 8 B
+    of scales (one 8-byte word); the V4.1 page-footer page carries 16 B (two
+    8-byte words), which a single-scale-word kernel would mis-address."""
     torch.manual_seed(2)
-    bs, row, scale = 32, 584, 8
+    bs = 32
     vals = row - scale
-    page = bs * row  # 18688
-    block_bytes, nl, nb = 116928, 3, 8
+    page = bs * row
+    nl, nb = 3, 8
+    block_bytes = nl * page
     dev = torch.device(torch_device_type)
 
     def make():

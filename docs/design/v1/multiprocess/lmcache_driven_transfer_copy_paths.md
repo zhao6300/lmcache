@@ -66,6 +66,18 @@ the allocator's virtual offset, exactly as `lmcache_memcpy_async` does: each
 64 MB pin chunk is a separate `cudaHostRegister` region and a copy spanning
 two of them fails with `cudaErrorInvalidValue`.
 
+Blocked-scale pages (`NL_X_NB_BSV_BSS`) still take the kernel path: one block
+stores all tokens' values first and all their scales after. The row width
+identifies the record and its per-token scale width (`BLOCKED_SCALE_BYTES` in
+`lmcache/v1/common/kv_format/types.py`, mirrored by
+`blocked_scale_bytes_for_row` in `csrc/engine_kv_format.h`): 132/68-byte
+indexer rows carry one fp32 scale, 584-byte DeepSeek-V4 rows 8 B of UE8M0
+scales, and the 528-byte DeepSeek-V4.1 page-footer row 16 B. The kernel picks
+the widest transfer word dividing both the row and the scale, so the 16-byte
+footer scale is two 8-byte words. A 528-byte record is per-token by default;
+only the engine's `blocked_scale` layout hint (SM120 `cake`) makes it a footer
+page.
+
 ## Flow (direct path)
 
 ```

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 __all__ = ["_blocked_scale_views", "_format_spec"]
 
 # First Party
-from lmcache.v1.common.kv_format.types import transfer_word_bytes
+from lmcache.v1.common.kv_format.types import scale_bytes_for_row
 
 
 def _blocked_scale_views(
@@ -39,11 +39,13 @@ def _blocked_scale_views(
         ``[NB, BS, row - scale_units]`` and ``[NB, BS, scale_units]``.
     """
     num_blocks, block_size, row = blocks.shape
-    # The per-token scale is one transfer word (fp32 for the indexer, 8 B of UE8M0
-    # for the V4 main KV), the native kernels' contract.
-    scale_units = (
-        transfer_word_bytes(row * blocks.element_size()) // blocks.element_size()
+    # The record table gives the per-token scale width: fp32 for the indexer,
+    # 8 B of UE8M0 for the V4 main KV, 16 B for the V4.1 page-footer record.
+    scale_bytes = scale_bytes_for_row(row * blocks.element_size())
+    assert scale_bytes is not None, (
+        f"blocked-scale format with an unknown {row}-element row"
     )
+    scale_units = scale_bytes // blocks.element_size()
     val_units = row - scale_units
     # ``view`` rather than ``flatten``: a copy would silently drop the writes.
     flat = blocks.view(num_blocks, block_size * row)

@@ -44,10 +44,21 @@ def resolve_vllm_kv_layout(
     return kv_layout
 
 
-def _is_blocked_scale_plane(t: torch.Tensor) -> bool:
-    """Whether a per-layer uint8 plane is a blocked-scale page (DSA indexer K,
-    DeepSeek-V4 packed main KV; see ``BLOCKED_SCALE_ROWS``)."""
-    return t.dtype == torch.uint8 and is_blocked_scale_row(int(t.shape[-1]))
+def _is_blocked_scale_plane(t: torch.Tensor, layout_hints: LayoutHints) -> bool:
+    """Whether a per-layer uint8 plane is a blocked-scale page.
+
+    The 132/68-byte indexer and 584-byte DeepSeek-V4 main-KV rows identify
+    themselves. The 528-byte DeepSeek-V4.1 record does not: its default form is
+    per-token (``[512 values | 16 scale bytes]``) and only the SM120 ``cake``
+    backend stores it as a page footer (``[BS x 512][BS x 16]``), so the
+    engine must say which layout it wrote.
+    """
+    if t.dtype != torch.uint8:
+        return False
+    row_bytes = int(t.shape[-1])
+    if row_bytes == 528:
+        return bool(layout_hints.get("blocked_scale"))
+    return is_blocked_scale_row(row_bytes)
 
 
 class VLLM_Detector(EngineDetector):
@@ -77,11 +88,27 @@ class VLLM_Detector(EngineDetector):
             and isinstance(kv_caches[0], torch.Tensor)
             and kv_caches[0].dim() == 4
         ):
+            shape = kv_caches[0].shape
+            # Packed head slots (vLLM ``num_head_slots``) are the logical H
+            # axis of the page. They are one contiguous run per token, so the
+            # fused-K/V format transfers them as opaque bytes; verify the
+            # engine's hint matches the registered view instead of trusting it.
+            num_slots = layout_hints.get("num_head_slots")
+            if num_slots is not None:
+                slot_axis = 1 if is_hnd else 2
+                if int(shape[slot_axis]) != int(num_slots):
+                    raise ValueError(
+                        "vLLM reported num_head_slots="
+                        f"{num_slots} but the registered KV view has "
+                        f"{int(shape[slot_axis])} head slots on axis "
+                        f"{slot_axis} (shape {tuple(shape)})"
+                    )
             # MLA planes (DSA indexer K, DeepSeek-V4 packed KV) are [B, H=1, N, C]
             # under either layout hint: squeeze that axis so the page gets its format.
-            shape = kv_caches[0].shape
             head_axis = 1 if int(shape[1]) == 1 else 2
-            if int(shape[head_axis]) == 1 and _is_blocked_scale_plane(kv_caches[0]):
+            if int(shape[head_axis]) == 1 and _is_blocked_scale_plane(
+                kv_caches[0], layout_hints
+            ):
                 return (
                     lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
                     [t.squeeze(head_axis) for t in kv_caches],
@@ -131,7 +158,7 @@ class VLLM_Detector(EngineDetector):
                     return lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS, kv_caches
                 return lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, kv_caches
         if list_depth == 1 and tensor_ndim == 3:  # MLA (or DSA indexer cache)
-            if _is_blocked_scale_plane(first_tensor):
+            if _is_blocked_scale_plane(first_tensor, layout_hints):
                 return lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS, kv_caches
             return lmcache_native.EngineKVFormat.NL_X_NB_BS_HS, kv_caches
         if list_depth == 2 and tensor_ndim == 4:

@@ -342,6 +342,25 @@ LMC_KV_FORMAT_HD constexpr bool is_fused_packed(EngineKVFormat f) {
   return format_facts(f).is_fused_packed;
 }
 
+// Per-token scale width of an NL_X_NB_BSV_BSS record, in bytes. The record is
+// [BS x values][BS x scales] and the row width alone identifies it:
+// 132/68-byte indexer rows carry an fp32 scale, 584-byte V4 rows 8 B of UE8M0
+// scales, and the 528-byte V4.1 page-footer row 16 B of UE8M0 scales. Keep in
+// sync with BLOCKED_SCALE_BYTES in lmcache/v1/common/kv_format/types.py.
+LMC_KV_FORMAT_HD constexpr int blocked_scale_bytes_for_row(int row_bytes) {
+  switch (row_bytes) {
+    case 132:
+    case 68:
+      return 4;
+    case 584:
+      return 8;
+    case 528:
+      return 16;
+    default:
+      return 4;
+  }
+}
+
 // One list entry per layer, each entry is a tuple of paged tensors.
 LMC_KV_FORMAT_HD constexpr bool is_kv_second_tuple(EngineKVFormat f) {
   return format_facts(f).is_kv_second_tuple;

@@ -204,3 +204,30 @@ class TestResolveVllmKVLayout:
     def test_unsupported_hint_rejected(self, resolve):
         with pytest.raises(ValueError, match="LHBNC"):
             resolve({"kv_layout": "LHBNC"}, cpu_attention_backend=False)
+
+
+class TestPackedHeadSlotHints:
+    def test_groups_report_slots_and_head_major_order(self):
+        spec = SimpleNamespace(num_head_slots=16, kv_head_major_slots=True)
+        group = SimpleNamespace(
+            kv_cache_specs={"layer.0": spec}, enable_kv_transfer=True
+        )
+        kv_cache_config = SimpleNamespace(kv_cache_groups=[group])
+
+        hints = vllm_layout_hints(make_vllm_config("LBNHC"), kv_cache_config)
+
+        assert hints["kv_layout"] == "NHD"
+        assert hints["num_head_slots"] == 16
+        assert hints["kv_head_major_slots"] is True
+
+    def test_non_transferable_group_is_not_reported(self):
+        spec = SimpleNamespace(num_head_slots=16, kv_head_major_slots=True)
+        group = SimpleNamespace(
+            kv_cache_specs={"layer.0": spec}, enable_kv_transfer=False
+        )
+        kv_cache_config = SimpleNamespace(kv_cache_groups=[group])
+
+        hints = vllm_layout_hints(make_vllm_config("LBNHC"), kv_cache_config)
+
+        assert "num_head_slots" not in hints
+        assert "kv_head_major_slots" not in hints
