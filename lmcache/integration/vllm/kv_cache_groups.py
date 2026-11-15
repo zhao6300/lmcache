@@ -194,10 +194,9 @@ def get_group_prefix_replay_tokens(group: Any) -> int:
 def get_group_sliding_window(group: Any) -> int:
     """Return the sliding window of a group vLLM allocates as a sliding window.
 
-    vLLM after RFC #42449 keeps no window on the spec: it is the
+    vLLM after RFC #42449 keeps no window on the spec; it is the
     ``sliding_window`` of the group's ``SlidingWindowManager`` parameters
-    (``KVCacheGroup.manager_config``). Older vLLM reads it off the spec instead,
-    which :func:`_resolve_per_layer_sw_sizes` handles.
+    (``KVCacheGroup.manager_config``). Older vLLM reads it off the spec.
 
     Args:
         group: A vLLM ``KVCacheGroup`` (either interface generation).
@@ -205,15 +204,8 @@ def get_group_sliding_window(group: Any) -> int:
     Returns:
         The window in tokens, or ``-1`` when the group is not a sliding window.
     """
-    config = getattr(group, "manager_config", None)
-    manager_cls = getattr(config, "manager_cls", None)
-    if not any(
-        cls.__name__ == "SlidingWindowManager"
-        for cls in getattr(manager_cls, "__mro__", ())
-    ):
-        return -1
-    window = getattr(getattr(config, "params", None), "sliding_window", None)
-    return int(window) if isinstance(window, int) and window > 0 else -1
+    window = group_sliding_window(group, get_group_kv_cache_spec(group))
+    return window if window is not None else -1
 
 
 def is_scratch_group(group: Any, *, store_replay_windows: bool = False) -> bool:
@@ -233,9 +225,8 @@ def is_scratch_group(group: Any, *, store_replay_windows: bool = False) -> bool:
     """
     if store_replay_windows and get_group_prefix_replay_tokens(group) > 0:
         return False
-    prefix_cacheable = getattr(group, "prefix_cacheable", None)
-    if isinstance(prefix_cacheable, bool):
-        return not prefix_cacheable
+    if _manager_config(group) is not None:
+        return not group.prefix_cacheable
     return is_scratch_spec(
         get_group_kv_cache_spec(group), store_replay_windows=store_replay_windows
     )
@@ -328,18 +319,143 @@ def _is_sliding_window_spec(spec: Any) -> bool:
     return any(cls.__name__ == "SlidingWindowSpec" for cls in type(spec).__mro__)
 
 
-def _is_cachable_mamba_spec(spec: Any) -> bool:
-    """Return whether the spec is a snapshotting Mamba/linear-attention spec.
+# vLLM's allocation-policy refactor (vllm-project/vllm#61452) replaced
+# ``KVCacheGroupSpec.kv_cache_spec`` with ``KVCacheGroup.kv_cache_specs`` plus a
+# ``manager_config`` that holds the sliding window and the Mamba cache mode.
+# The ``group_*`` helpers below read either form.
+
+
+def _manager_config(group: Any) -> Any:
+    return getattr(group, "manager_config", None)
+
+
+def _manager_is(group: Any, name: str) -> bool:
+    config = _manager_config(group)
+    return config is not None and any(
+        cls.__name__ == name for cls in config.manager_cls.__mro__
+    )
+
+
+def group_layer_specs(group: Any) -> dict[str, Any]:
+    """Return each layer's KV cache spec in a vLLM KV cache group.
+
+    Older vLLM keeps one ``kv_cache_spec`` per group, possibly a
+    ``UniformTypeKVCacheSpecs`` with per-layer specs inside.
+    """
+    specs = getattr(group, "kv_cache_specs", None)
+    if isinstance(specs, dict):
+        return specs
+    spec = group.kv_cache_spec
+    inner = getattr(spec, "kv_cache_specs", None)
+    if isinstance(inner, dict) and inner:
+        return {name: inner[name] for name in group.layer_names}
+    return {name: spec for name in group.layer_names}
+
+
+def group_specs(group: Any) -> list[Any]:
+    """Return the distinct KV cache specs of a vLLM KV cache group.
+
+    On new vLLM this is ``distinct_specs``: under pipeline parallelism a group
+    projected onto a stage can hold none of its layers in ``kv_cache_specs``.
+    Groups without that attribute (test doubles, older wrappers) fall back to
+    the per-layer mapping.
+    """
+    specs = getattr(group, "kv_cache_specs", None)
+    if isinstance(specs, dict):
+        distinct = getattr(group, "distinct_specs", None)
+        if distinct:
+            return list(distinct)
+        unique: list[Any] = []
+        for spec in specs.values():
+            if not any(spec is seen for seen in unique):
+                unique.append(spec)
+        return unique
+    spec = getattr(group, "kv_cache_spec", None)
+    if spec is None:
+        return []
+    inner = getattr(spec, "kv_cache_specs", None)
+    if isinstance(inner, dict):
+        return list(inner.values())
+    return [spec]
+
+
+def group_sliding_window(group: Any, spec: Any) -> int | None:
+    """Return the sliding window in tokens of one layer, or ``None``."""
+    if _manager_config(group) is not None:
+        if _manager_is(group, "SlidingWindowManager"):
+            return int(_manager_config(group).params.sliding_window)
+        return None
+    if _is_sliding_window_spec(spec):
+        return spec.sliding_window
+    return None
+
+
+def _is_mamba_spec(spec: Any) -> bool:
+    return any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
+
+
+def group_mamba_cache_mode(group: Any, spec: Any) -> str:
+    """Return the Mamba cache mode set for one layer, ``"none"`` if unset."""
+    config = _manager_config(group)
+    if config is not None:
+        return getattr(config.params, "mamba_cache_mode", "none")
+    return getattr(spec, "mamba_cache_mode", "none")
+
+
+def _is_cachable_mamba(group: Any, spec: Any) -> bool:
+    """Return whether the layer is Mamba in a snapshotting cache mode.
 
     Align mode snapshots only the last block; all mode snapshots every block
     boundary. Either way a restore consumes only the last matched block's
     page, so both behave like a cross-chunk sliding window of one block.
-    Checked by class name (like :func:`_is_sliding_window_spec`) so this
-    module stays importable without vLLM.
     """
-    return any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__) and getattr(
-        spec, "mamba_cache_mode", "none"
-    ) in ("align", "all")
+    return _is_mamba_spec(spec) and group_mamba_cache_mode(group, spec) in (
+        "align",
+        "all",
+    )
+
+
+def is_per_request_state_group(group: Any) -> bool:
+    """Return whether the group is a per-request ring (see
+    :func:`is_per_request_state_spec`)."""
+    if _manager_config(group) is not None:
+        return is_scratch_group(group) and _manager_is(group, "CircularBufferManager")
+    return is_per_request_state_spec(group.kv_cache_spec)
+
+
+def is_align_mode_mamba_group(group: Any) -> bool:
+    """Return whether the group holds Mamba layers in align mode (see
+    :func:`is_align_mode_mamba_spec`)."""
+    if _manager_config(group) is None:
+        return is_align_mode_mamba_spec(group.kv_cache_spec)
+    return any(
+        _is_mamba_spec(spec) and group_mamba_cache_mode(group, spec) == "align"
+        for spec in group_specs(group)
+    )
+
+
+def tokens_per_group_block(
+    group: Any, dcp_size: int, *, store_replay_windows: bool = False
+) -> int:
+    """Return the global tokens one block id of the group covers (see
+    :func:`get_tokens_per_block`).
+
+    Args:
+        group: A vLLM ``KVCacheGroup`` (either interface generation).
+        dcp_size: Decode-context-parallel size.
+        store_replay_windows: See :func:`is_scratch_group`.
+
+    Returns:
+        The group's token span per block id, ``0`` for a scratch group.
+    """
+    if is_scratch_group(group, store_replay_windows=store_replay_windows):
+        return 0
+    spec = get_group_kv_cache_spec(group)
+    if spec is None:
+        return 0
+    return get_tokens_per_block(
+        spec, dcp_size, store_replay_windows=store_replay_windows
+    )
 
 
 def _resolve_per_layer_sw_sizes(
@@ -352,7 +468,7 @@ def _resolve_per_layer_sw_sizes(
     Will resolve -1 for non-sliding-window layers.
 
     Args:
-        vllm_groups: vLLM ``KVCacheGroupSpec`` instances.
+        vllm_groups: vLLM KV cache groups.
         layer_to_idx: Layer name to registered tensor index mapping.
         num_layers: Number of registered KV tensors.
 
@@ -365,16 +481,11 @@ def _resolve_per_layer_sw_sizes(
     """
     per_layer_sw_size = [-1] * num_layers
     for group in vllm_groups:
-        group_window = get_group_sliding_window(group)
-        for name in group.layer_names:
-            layer_spec = get_layer_kv_cache_spec(group, name)
-            if layer_spec is None:
-                continue
-            if _is_sliding_window_spec(layer_spec):
-                per_layer_sw_size[layer_to_idx[name]] = layer_spec.sliding_window
-            elif group_window > 0:
-                per_layer_sw_size[layer_to_idx[name]] = group_window
-            elif _is_cachable_mamba_spec(layer_spec):
+        for name, layer_spec in group_layer_specs(group).items():
+            sliding_window = group_sliding_window(group, layer_spec)
+            if sliding_window is not None:
+                per_layer_sw_size[layer_to_idx[name]] = sliding_window
+            elif _is_cachable_mamba(group, layer_spec):
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.block_size
     return per_layer_sw_size
 
@@ -432,22 +543,19 @@ def _resolve_per_layer_recurrent(
     """Resolve whether each registered KV tensor holds recurrent state pages.
 
     Args:
-        vllm_groups: vLLM ``KVCacheGroupSpec`` instances.
+        vllm_groups: vLLM KV cache groups.
         layer_to_idx: Layer name to registered tensor index mapping.
         num_layers: Number of registered KV tensors.
 
     Returns:
         A list of length ``num_layers``: ``True`` for Mamba/linear-attention
-        layers in a snapshotting cache mode (see :func:`_is_cachable_mamba_spec`),
+        layers in a snapshotting cache mode (see :func:`_is_cachable_mamba`),
         ``False`` for attention layers.
     """
     per_layer_recurrent = [False] * num_layers
     for group in vllm_groups:
-        for name in group.layer_names:
-            layer_spec = get_layer_kv_cache_spec(group, name)
-            if layer_spec is None:
-                continue
-            if _is_cachable_mamba_spec(layer_spec):
+        for name, layer_spec in group_layer_specs(group).items():
+            if _is_cachable_mamba(group, layer_spec):
                 per_layer_recurrent[layer_to_idx[name]] = True
     return per_layer_recurrent
 
@@ -463,7 +571,7 @@ def _resolve_per_layer_tp_replicated(
     same KV for the layer, or the same token shard of it under DCP.
 
     Args:
-        vllm_groups: vLLM ``KVCacheGroupSpec`` instances.
+        vllm_groups: vLLM KV cache groups.
         layer_to_idx: Layer name to registered tensor index mapping.
         num_layers: Number of registered KV tensors.
 
@@ -472,10 +580,7 @@ def _resolve_per_layer_tp_replicated(
     """
     per_layer_tp_replicated = [False] * num_layers
     for group in vllm_groups:
-        for name in group.layer_names:
-            layer_spec = get_layer_kv_cache_spec(group, name)
-            if layer_spec is None:
-                continue
+        for name, layer_spec in group_layer_specs(group).items():
             max_tp_shards = getattr(layer_spec, "max_tp_shards", None)
             if max_tp_shards == 1 or (
                 max_tp_shards is None and _is_mla_spec(layer_spec)
@@ -548,7 +653,7 @@ def create_engine_group_infos_from_vllm(
 
     This is the single entry point for the vLLM -> LMCache conversion. It reads
     the vLLM-specific fields (``KVCacheConfig.kv_cache_groups`` and
-    ``KVCacheGroupSpec.layer_names`` from the v1 KV cache interface), maps each
+    the groups' ``layer_names`` from the v1 KV cache interface), maps each
     engine KV cache group's layer names to registered tensor indices, then
     splits the layers by physical transfer identity using the real tensors (via
     the shared :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`).

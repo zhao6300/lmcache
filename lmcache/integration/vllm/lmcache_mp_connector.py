@@ -68,13 +68,13 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 )
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
-    get_group_kv_cache_spec,
     get_group_prefix_replay_tokens,
-    get_tokens_per_block,
-    is_align_mode_mamba_spec,
-    is_per_request_state_spec,
+    group_specs,
+    is_align_mode_mamba_group,
+    is_per_request_state_group,
     is_scratch_group,
     is_transferable_group,
+    tokens_per_group_block,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
 from lmcache.integration.vllm.lmcache_mp_metadata import (
@@ -347,24 +347,8 @@ def _iter_group_specs(
     for group in kv_cache_config.kv_cache_groups:
         if not is_transferable_group(group):
             continue
-        per_layer_specs = getattr(group, "kv_cache_specs", None)
-        if isinstance(per_layer_specs, dict) and per_layer_specs:
-            for spec in per_layer_specs.values():
-                yield group, spec
-            continue
-        # A group projected onto a pipeline stage can hold none of its layers.
-        distinct_specs = getattr(group, "distinct_specs", None)
-        if distinct_specs:
-            for spec in distinct_specs:
-                yield group, spec
-            continue
-        group_spec = getattr(group, "kv_cache_spec", None)
-        inner = getattr(group_spec, "kv_cache_specs", None)
-        if isinstance(inner, dict) and inner:
-            for spec in inner.values():
-                yield group, spec
-        else:
-            yield group, group_spec
+        for spec in group_specs(group):
+            yield group, spec
 
 
 def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[Any]:
@@ -404,11 +388,8 @@ def get_group_tokens_per_block(
         else ()
     )
     return [
-        get_tokens_per_block(
-            get_group_kv_cache_spec(group),
-            dcp_size,
-            store_replay_windows=store_replay_windows,
-            scratch=is_scratch_group(group, store_replay_windows=store_replay_windows),
+        tokens_per_group_block(
+            group, dcp_size, store_replay_windows=store_replay_windows
         )
         for group in groups
     ] or [vllm_config.cache_config.block_size * dcp_size]
@@ -426,9 +407,7 @@ def get_prefix_replay_tokens(kv_cache_config: "KVCacheConfig | None") -> int:
         if kv_cache_config is not None
         else ()
     )
-    return max(
-        (get_group_prefix_replay_tokens(group) for group in groups), default=0
-    )
+    return max((get_group_prefix_replay_tokens(group) for group in groups), default=0)
 
 
 def get_vllm_scheduler_block_size(
@@ -567,11 +546,14 @@ def get_resolved_attention_block_sizes(
         The resolved attention block sizes. Falls back to vLLM's cache block
         size when group metadata is unavailable.
     """
+    groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else ()
     block_sizes = {
         spec.block_size
-        for group, spec in _iter_group_specs(kv_cache_config)
-        if any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
+        for group in groups
+        if is_transferable_group(group)
         and not is_scratch_group(group, store_replay_windows=store_replay_windows)
+        for spec in group_specs(group)
+        if any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
     }
     if block_sizes:
         return block_sizes
@@ -889,7 +871,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 for engine_group_idx, group in enumerate(
                     kv_cache_config.kv_cache_groups
                 )
-                if is_per_request_state_spec(get_group_kv_cache_spec(group))
+                if is_per_request_state_group(group)
             )
             if self._save_unfull_chunk and kv_cache_config is not None
             else ()
@@ -1121,7 +1103,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 for engine_group_idx, group in enumerate(
                     kv_cache_config.kv_cache_groups
                 )
-                if is_align_mode_mamba_spec(get_group_kv_cache_spec(group))
+                if is_align_mode_mamba_group(group)
             ]
             if kv_cache_config is not None
             else []
