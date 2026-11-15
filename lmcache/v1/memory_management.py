@@ -488,8 +488,12 @@ def _resolve_pinned_alloc_free(
     shm_name: Optional[str] = None,
     size: Optional[int] = None,
     use_hugepages: bool = False,
+    numa_node: Optional[int] = None,
 ) -> PinnedAllocFree:
     """Resolve the alloc/free function pair based on memory type.
+
+    ``numa_node`` pins the allocation to that node. It takes precedence over
+    ``numa_mapping``, which picks the node of the calling thread's GPU.
 
     Returns:
         A PinnedAllocFree with the resolved functions and their extra
@@ -504,16 +508,20 @@ def _resolve_pinned_alloc_free(
             free_fn=device_ops.free_shm_pinned_ptr,
             free_args=(size, shm_name),
         )
-    elif numa_mapping:
-        if torch_dev.is_available():
-            current_device_id = torch_dev.current_device()
+    elif numa_node is not None or numa_mapping:
+        if numa_node is not None:
+            numa_id = numa_node
         else:
-            current_device_id = 0
-        gpu_to_numa_mapping = numa_mapping.gpu_to_numa_mapping
-        assert current_device_id in gpu_to_numa_mapping, (
-            f"Current device {current_device_id} is not in the GPU NUMA mapping."
-        )
-        numa_id = gpu_to_numa_mapping[current_device_id]
+            assert numa_mapping is not None
+            if torch_dev.is_available():
+                current_device_id = torch_dev.current_device()
+            else:
+                current_device_id = 0
+            gpu_to_numa_mapping = numa_mapping.gpu_to_numa_mapping
+            assert current_device_id in gpu_to_numa_mapping, (
+                f"Current device {current_device_id} is not in the GPU NUMA mapping."
+            )
+            numa_id = gpu_to_numa_mapping[current_device_id]
         if use_hugepages:
             return PinnedAllocFree(
                 alloc_fn=device_ops.alloc_hugepage_pinned_numa_ptr,
@@ -573,6 +581,7 @@ def _allocate_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    numa_node: Optional[int] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
@@ -582,6 +591,7 @@ def _allocate_cpu_memory(
         shm_name,
         size,
         use_hugepages,
+        numa_node,
     )
 
     try:
@@ -625,6 +635,7 @@ def _free_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    numa_node: Optional[int] = None,
 ) -> None:
     if torch_dev.is_available():
         torch_dev.synchronize()
@@ -634,6 +645,7 @@ def _free_cpu_memory(
         shm_name,
         size,
         use_hugepages,
+        numa_node,
     )
     resolved.free(buffer.data_ptr())
 

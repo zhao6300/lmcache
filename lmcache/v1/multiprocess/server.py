@@ -382,6 +382,7 @@ def _start_cache_server(
     if (
         mp_config.supported_transfer_mode != "lmcache_driven"
         and len(storage_manager_config.l1_manager_configs) == 1
+        and storage_manager_config.l1_manager_config.memory_config.numa_node is None
     ):
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         if mp_config.shm_name is not None:

@@ -41,6 +41,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         """
 
         self.numa_mapping = kwargs.get("numa_mapping", None)
+        self.numa_node: int | None = kwargs.get("numa_node", None)
         self.use_hugepages = use_hugepages
         self.align_bytes = kwargs.get("align_bytes", AddressManager.ALIGN_BYTES)
         if self.align_bytes <= 0 or self.align_bytes & (self.align_bytes - 1) != 0:
@@ -58,7 +59,11 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         self.size = size
 
         self.buffer = memory_management._allocate_cpu_memory(
-            size, self.numa_mapping, self.shm_name, use_hugepages=use_hugepages
+            size,
+            self.numa_mapping,
+            self.shm_name,
+            use_hugepages=use_hugepages,
+            numa_node=self.numa_node,
         )
 
         self._unregistered = False
@@ -257,6 +262,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 self.numa_mapping,
                 self.shm_name,
                 use_hugepages=self.use_hugepages,
+                numa_node=self.numa_node,
             )
             self._unregistered = True
 

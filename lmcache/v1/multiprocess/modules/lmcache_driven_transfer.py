@@ -70,6 +70,7 @@ from lmcache.v1.platform.fd_channel import (
     fd_channel_path,
     is_fd_channel_supported,
 )
+from lmcache.v1.system_detection import get_numa_topology, pin_current_thread_near_gpu
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -434,6 +435,20 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             self._release_entries(entries)
         return reaped_ids
 
+    def _pin_to_gpu_node(self, cache_context: BaseCacheContext) -> None:
+        """Run the calling worker thread on the CPUs of the GPU's NUMA node.
+
+        Does nothing unless the L1 pools are NUMA-bound, and when the GPU's
+        node is unknown. The thread follows the GPU of the request it serves,
+        so a worker shared by clients on different nodes still runs near the
+        GPU it is serving.
+        """
+        if not self._ctx.storage_manager.numa_aware:
+            return
+        gpu_index = cache_context.device.index
+        if gpu_index is not None:
+            pin_current_thread_near_gpu(get_numa_topology(), gpu_index)
+
     def _release_entries(self, entries: list[ContextEntry]) -> None:
         """Release a batch of entries and reclaim their device memory.
 
@@ -720,6 +735,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             return b"", False, []
         cache_context = entry.cache_context
+        self._pin_to_gpu_node(cache_context)
         model_name = entry.model_name
         event_backend = entry.event_backend
         if event_backend is None:
@@ -874,7 +890,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         object_group_id=obj_group_id,
                     )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc
+                        keys_to_reserve,
+                        layout_desc,
+                        origin_device=cache_context.device,
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -1069,6 +1087,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             return b"", False
         cache_context = entry.cache_context
+        self._pin_to_gpu_node(cache_context)
         model_name = entry.model_name
         event_backend = entry.event_backend
         if event_backend is None:
@@ -1444,6 +1463,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     [obj_key],
                     get_unfull_chunk_layout_desc(cache_context, obj_group_id),
                     is_temporary=is_temporary,
+                    origin_device=cache_context.device,
                 )
             )
             memory_obj = reserved.get(obj_key)

@@ -11,6 +11,9 @@ from typing import Any, Iterator, Optional, cast
 import threading
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.lmcache_native import PeriodicEventNotifier
 from lmcache.logging import init_logger
@@ -154,6 +157,10 @@ class StorageManager:
 
             self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
             self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
+            # The L1 topology is fixed at startup, so this never changes.
+            self._numa_aware = any(
+                m.config.memory_config.numa_node is not None for m in self._l1_managers
+            )
 
             self._write_policy = create_write_policy(config.write_policy)
 
@@ -291,12 +298,13 @@ class StorageManager:
             cleanup.pop_all()
 
     # External APIs for serving engine integration code to call
-    @enable_tracing()
+    @enable_tracing(redact=("origin_device",))
     def reserve_write(
         self,
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         is_temporary: bool = False,
+        origin_device: torch.device | int | None = None,
     ) -> dict[ObjectKey, MemoryObj]:
         """
         Reserve the object for writing into the storage manager.
@@ -308,6 +316,8 @@ class StorageManager:
             is_temporary: Store the objects as temporary: L1 deletes each one
                 when its last read lock is released, and never offloads it
                 to L2.
+            origin_device: The GPU the store reads from, for write policies
+                that place by origin. ``None`` when the caller has no GPU.
         Returns:
             dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
                 reserved memory objects. Note that not all requested keys could be
@@ -317,16 +327,15 @@ class StorageManager:
             ValueError: The write policy selected an unregistered L1 manager
                 or did not place every key exactly once.
         """
-        targets = self._write_policy.select_write_targets(keys, self._l1_managers)
+        targets = self._write_policy.select_write_targets_from(
+            keys, self._l1_managers, origin_device
+        )
         _validate_write_targets(keys, targets, self._l1_managers_by_id)
         reserve_result: dict[ObjectKey, L1OperationResult] = {}
         for owner, group in targets.items():
             reserve_result.update(
-                self._l1_managers_by_id[owner].reserve_write(
-                    keys=group,
-                    is_temporary=[is_temporary] * len(group),
-                    layout_desc=layout_desc,
-                    tag=_L1_WRITE_TAG,
+                self._reserve_with_spill(
+                    owner, group, is_temporary, layout_desc, origin_device
                 )
             )
 
@@ -1352,6 +1361,14 @@ class StorageManager:
         """
         return len(self._l1_managers) > 1
 
+    @property
+    def numa_aware(self) -> bool:
+        """Whether the L1 pools are bound to NUMA nodes.
+
+        Callers use it to run the thread that serves a GPU on that GPU's node.
+        """
+        return self._numa_aware
+
     def report_status(self) -> dict:
         """Return per-L1 status and aggregate health; retain single-L1 field names."""
         managers = self._l1_managers
@@ -1468,6 +1485,44 @@ class StorageManager:
             return
         for owner, keys in completion:
             self.finish_read_prefetched(keys, l1_owners=dict.fromkeys(keys, owner))
+
+    def _reserve_with_spill(
+        self,
+        owner: int,
+        keys: list[ObjectKey],
+        is_temporary: bool,
+        layout_desc: MemoryLayoutDesc,
+        origin_device: torch.device | int | None,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Reserve ``keys`` in ``owner``, spilling out-of-memory keys to the
+        L1s the write policy names, in order.
+
+        A key that fails for another reason, such as a write conflict, is not
+        retried elsewhere.
+        """
+        result = self._l1_managers_by_id[owner].reserve_write(
+            keys=keys,
+            is_temporary=[is_temporary] * len(keys),
+            layout_desc=layout_desc,
+            tag=_L1_WRITE_TAG,
+        )
+        pending = [k for k in keys if result[k][0] == L1Error.OUT_OF_MEMORY]
+        if not pending:
+            return result
+        for spill_owner in self._write_policy.select_spill_targets(
+            owner, origin_device, self._l1_managers
+        ):
+            retried = self._l1_managers_by_id[spill_owner].reserve_write(
+                keys=pending,
+                is_temporary=[is_temporary] * len(pending),
+                layout_desc=layout_desc,
+                tag=_L1_WRITE_TAG,
+            )
+            result.update(retried)
+            pending = [k for k in pending if retried[k][0] == L1Error.OUT_OF_MEMORY]
+            if not pending:
+                break
+        return result
 
     def _group_by_owner(
         self, keys: list[ObjectKey], owners: Mapping[ObjectKey, int]

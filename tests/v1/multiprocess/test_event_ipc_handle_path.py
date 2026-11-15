@@ -75,6 +75,8 @@ class _NoopDispatcher:
 class _FakeStorageManager:
     """Minimal storage surface used by the server handle-path test."""
 
+    numa_aware = False
+
     def finish_write(
         self, keys: list[object], l1_owners: dict[object, int] | None = None
     ) -> None:
@@ -90,6 +92,7 @@ class _FakeStorageManager:
         self,
         keys: list[object],
         layout: object,
+        origin_device: object = None,
     ) -> dict[object, object]:
         return {}
 

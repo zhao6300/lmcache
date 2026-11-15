@@ -67,6 +67,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.size_in_bytes,
             config.align_bytes,
             mlock=config.mlock,
+            numa_node=config.numa_node,
         )
     else:
         logger.debug(
@@ -93,6 +94,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.size_in_bytes,
             align_bytes=config.align_bytes,
             use_hugepages=config.use_hugepages,
+            numa_node=config.numa_node,
         )
 
 
