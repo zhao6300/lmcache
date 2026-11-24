@@ -1421,6 +1421,8 @@ class LMCacheMPWorkerAdapter:
         self.previously_finished: set[str] = set()
         # Request IDs already returned as finished_sending to the scheduler.
         # Prevents re-reporting the same ID after drain clears tracking sets.
+        # Pruned once vLLM stops presenting the id (see
+        # _process_finished_stores), so it stays bounded.
         self._returned_finished: set[str] = set()
 
         self.model_name = model_name
@@ -2087,6 +2089,14 @@ class LMCacheMPWorkerAdapter:
     ) -> set[str]:
         """Merge LMCache-side and engine-side finished store info."""
         self.finished_stores.update(finished_req_ids_from_lmcache)
+        # An id that was already reported as finished_sending has no report
+        # left to wait for; vLLM freed its blocks on that earlier report. A
+        # store completion can still land here afterwards (its engine report
+        # was skipped as a duplicate), and keeping it would pin the id in the
+        # tracking sets for the rest of the worker's life.
+        self.finished_stores.difference_update(self._returned_finished)
+        self.previously_finished.difference_update(self._returned_finished)
+
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
             if req_id in self._returned_finished:
@@ -2097,6 +2107,11 @@ class LMCacheMPWorkerAdapter:
                 ret_stores.add(req_id)
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
+        # An id only needs deduplicating while vLLM still presents it: once it
+        # leaves the engine's finished set, vLLM has consumed our report and
+        # cannot present it again. Keeping the rest would grow this set by one
+        # id per finished request for the worker's whole life.
+        self._returned_finished.intersection_update(finished_req_ids_from_engine)
         return ret_stores
 
     @_lmcache_nvtx_annotate

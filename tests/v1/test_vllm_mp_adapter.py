@@ -1253,6 +1253,59 @@ def test_store_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def test_reported_finished_id_is_forgotten_after_vllm_stops_presenting_it(
+    fake_adapter,
+) -> None:
+    """A reported id is only kept while vLLM still presents it.
+
+    vLLM hands out a finished id for the step where the request ended. The
+    dedup state must not grow by one id per finished request for the rest of
+    the worker's life.
+    """
+    adapter, _send_mock, _ = fake_adapter
+
+    assert adapter.get_finished({"req-1"})[0] == {"req-1"}
+    assert adapter._returned_finished == {"req-1"}
+
+    assert adapter.get_finished(set())[0] == set()
+    assert adapter._returned_finished == set()
+
+
+def test_finished_id_is_not_reported_twice_while_vllm_presents_it(
+    fake_adapter,
+) -> None:
+    """Consecutive steps may present the same finished id; report it once."""
+    adapter, _send_mock, _ = fake_adapter
+
+    assert adapter.get_finished({"req-1"})[0] == {"req-1"}
+    assert adapter.get_finished({"req-1"})[0] == set()
+
+
+def test_store_completing_after_the_report_is_forgotten(fake_adapter) -> None:
+    """A store that completes after the request was reported has nobody left
+    to wait for it; it must not stay queued as a finished store."""
+    adapter, _send_mock, _ = fake_adapter
+    transfer_ctx = MagicMock()
+    store_future = MagicMock(name="store_future")
+    store_future.query.return_value = False
+    transfer_ctx.submit_store.return_value = store_future
+    adapter.transfer_ctx = transfer_ctx
+
+    # The request ends before any store for it; vLLM gets the report.
+    assert adapter.get_finished({"req-1"})[0] == {"req-1"}
+
+    adapter.submit_store_request("req-1", _op([[0]]), None)
+    store_future.query.return_value = True
+    store_future.result.return_value = True
+
+    # vLLM repeats the report while the late store completes. The repeat is
+    # deduplicated, so the completion is never reported to anyone.
+    assert adapter.get_finished({"req-1"})[0] == set()
+    assert adapter.finished_stores == set()
+    assert adapter.previously_finished == set()
+    assert adapter.store_futures == {}
+
+
 def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     """Retrieve requests keep the exported CUDA event alive while pending."""
     adapter, _send_mock, _future = fake_adapter
