@@ -279,7 +279,7 @@ def test_close_after_notifier_shutdown_skips_the_stale_notifier() -> None:
     registration, which would point at freed native memory."""
     stale = MagicMock()
     with (
-        patch.object(p2p_mod, "P2PClient", return_value=MagicMock(spec=P2PClient)),
+        patch.object(p2p_mod.RequestClientFactory, "create", return_value=MagicMock()),
         patch.object(p2p_mod, "get_transfer_channel_context", return_value=MagicMock()),
         patch.object(p2p_mod, "PeriodicEventNotifier") as periodic,
     ):

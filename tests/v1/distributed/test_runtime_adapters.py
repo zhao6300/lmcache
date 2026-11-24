@@ -45,7 +45,6 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2AdapterConfig,
 )
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
-from lmcache.v1.distributed.p2p import P2PClient
 from lmcache.v1.distributed.storage_controllers.store_controller import StoreController
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     DefaultStorePolicy,
@@ -655,7 +654,7 @@ def strict_notifier() -> Iterator[type[_StrictNotifier]]:
     with (
         patch.object(storage_manager_mod, "PeriodicEventNotifier", _StrictNotifier),
         patch.object(p2p_mod, "PeriodicEventNotifier", _StrictNotifier),
-        patch.object(p2p_mod, "P2PClient", return_value=MagicMock(spec=P2PClient)),
+        patch.object(p2p_mod.RequestClientFactory, "create", return_value=MagicMock()),
         patch.object(p2p_mod, "get_transfer_channel_context", return_value=MagicMock()),
     ):
         yield _StrictNotifier
