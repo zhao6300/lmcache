@@ -13,6 +13,7 @@ from lmcache.v1.common.custom_types import (
     CBUnifiedLookupResult,
     IPCCacheServerKey,
     KVEventBatch,
+    PingResponse,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
     RegisterEngineDrivenContextPayload,
@@ -215,7 +216,7 @@ class RequestClient(Protocol):
     ) -> MessagingFuture[int]: ...
 
     @rpc_method
-    def ping(self, instance_id: int | None) -> MessagingFuture[bool]: ...
+    def ping(self, instance_id: int | None) -> MessagingFuture[PingResponse]: ...
 
     @rpc_method
     def report_block_allocation(

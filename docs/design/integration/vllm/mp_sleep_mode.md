@@ -72,11 +72,12 @@ one restore.
   released memory. vLLM does not schedule while asleep, so this only
   catches misuse.
 - **Heartbeat recovery stays out of the way.** A server restart during
-  sleep takes the heartbeat's unhealthy-to-healthy edge and runs the
-  recover callback. While the caches are released the callback skips
-  their re-registration and still reports healthy. It shares a lock
-  with both hooks, so a recovery cycle cannot register memory that the
-  engine is releasing. After restore, recovery works as before.
+  sleep takes the heartbeat's unhealthy-to-healthy edge (or its changed
+  server boot epoch) and runs the recover callback. While the caches are
+  released the callback skips their re-registration and still reports
+  healthy. It shares a lock with both hooks, so a recovery cycle cannot
+  register memory that the engine is releasing. After restore, recovery
+  works as before.
 - **Waking while the server is down degrades instead of failing.** If
   the heartbeat already marked the server unhealthy, restore clears the
   released state without contacting the server. Stores are dropped and

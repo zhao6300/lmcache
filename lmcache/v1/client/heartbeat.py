@@ -7,6 +7,7 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.common.custom_types import PingResponse
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
@@ -17,7 +18,7 @@ def send_ping(
     req_client: RequestClient,
     timeout: float,
     instance_id: int | None = None,
-) -> bool:
+) -> PingResponse | None:
     """Send one MP server health probe.
 
     Args:
@@ -27,19 +28,24 @@ def send_ping(
             or ``None`` for an untracked probe.
 
     Returns:
-        ``True`` when the server responds healthy, otherwise ``False``.
+        The server's response when it answers, otherwise ``None``.
     """
     try:
         return req_client.ping(instance_id).result(timeout=timeout)
     except TimeoutError:
-        return False
+        return None
     except Exception:
         logger.debug("LMCache heartbeat ping failed", exc_info=True)
-        return False
+        return None
 
 
 class HeartbeatThread(PeriodicThread):
     """Probe an MP server and publish health transitions to an adapter.
+
+    Each response carries the server's boot epoch. A changed epoch means the
+    server restarted and lost every in-memory registration, so the recover
+    callback runs even when no PING failed -- closing the window where a
+    restart completes between two probes.
 
     The recover callback runs before health is published, allowing an adapter
     to restore server-side registration before new work is admitted. Adapters
@@ -54,6 +60,7 @@ class HeartbeatThread(PeriodicThread):
         instance_id: int | None = None,
         *,
         name: str = "lmcache-heartbeat",
+        initial_epoch: str | None = None,
     ) -> None:
         """Initialize an MP heartbeat.
 
@@ -64,6 +71,10 @@ class HeartbeatThread(PeriodicThread):
             instance_id: Worker registration or scheduler subscription to
                 refresh, or ``None`` for an untracked probe.
             name: Background thread name.
+            initial_epoch: Boot epoch already observed before the heartbeat
+                started (e.g. a pre-registration probe), so the first PING can
+                detect a restart that happened in between. ``None`` adopts the
+                first response's epoch as the baseline.
         """
         super().__init__(
             name=name,
@@ -73,6 +84,7 @@ class HeartbeatThread(PeriodicThread):
         self._req_client = req_client
         self._health_event = health_event
         self._instance_id = instance_id
+        self._server_epoch = initial_epoch
         self._recover_callback: Callable[[], bool] = lambda: True
         self._unhealthy_callback: Callable[[], None] = lambda: None
         self._healthy_callback: Callable[[], bool] = self._set_health_event
@@ -124,7 +136,7 @@ class HeartbeatThread(PeriodicThread):
 
     def _execute(self) -> ThreadRunSummary:
         was_healthy = self._health_event.is_set()
-        healthy = send_ping(
+        response = send_ping(
             self._req_client,
             timeout=self.interval,
             instance_id=self._instance_id,
@@ -135,7 +147,27 @@ class HeartbeatThread(PeriodicThread):
                 message="stop requested; skipping health update",
             )
 
-        if healthy and not was_healthy:
+        healthy = response is not None
+        restarted = False
+        if response is not None:
+            epoch = response.server_epoch
+            previous_epoch = self._server_epoch
+            restarted = previous_epoch is not None and epoch != previous_epoch
+            self._server_epoch = epoch
+            if restarted:
+                logger.warning(
+                    "LMCache server restarted (epoch %s -> %s); "
+                    "re-registering before admitting work",
+                    previous_epoch,
+                    epoch,
+                )
+                # The replacement server lost every registration. Clear health
+                # before recovery, as on an unhealthy->healthy edge, so no
+                # store/retrieve reaches it before re-registration.
+                if self._health_event.is_set():
+                    self._publish_unhealthy()
+
+        if healthy and (restarted or not was_healthy):
             logger.warning(
                 "LMCache server is healthy again, triggering recovery callback"
             )
@@ -161,7 +193,7 @@ class HeartbeatThread(PeriodicThread):
         if not healthy and self._health_event.is_set():
             logger.warning("LMCache server is unhealthy — entering degraded mode")
             self._publish_unhealthy()
-        elif healthy and not was_healthy:
+        elif healthy and (restarted or not was_healthy):
             logger.warning(
                 "LMCache server is healthy again — resuming normal operation"
             )

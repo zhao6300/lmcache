@@ -42,7 +42,7 @@ engine worker adapter                            MP server
 |   -> re-register callback |   REGISTER        |   -> drop_instance_state(id) fan-out |
 |                           +------------------>|        |                |            |
 | register_kv_caches        |   STORE/RETRIEVE  |        v                v            |
-|  (no pings until traffic) |   (refresh too)   | LMCacheDriven/          Blend        |
+|  -> heartbeat starts      |   (refresh too)   | LMCacheDriven/          Blend        |
 |                           |                   |  EngineDriven           (CB rope     |
 |                           |                   |  TransferModule          dropped)    |
 |                           |                   |  Entry{.., last_seen,               |
@@ -53,17 +53,19 @@ engine worker adapter                            MP server
 
 ## 3. Protocol Change
 
-The PING payload changes in place from `[]` to `[int | None]`; the response stays
-`bool`, always `True`. `None` marks an untracked prober, including schedulers
-with KV events disabled. Event-enabled schedulers pass their UUID-derived
-subscription identity; the event module refreshes the subscription without
-creating a transfer registration. PING keeps its BLOCKING
-dispatch on the NORMAL thread pool. SERIALIZED dispatch was considered but rejected:
-SERIALIZED runs on the MQ main loop, where a slow `REGISTER_KV_CACHE` (also SERIALIZED) would
-block PING and make a live worker look dead. Sharing the NORMAL pool is in fact
-desirable — if the pool cannot answer PING within the heartbeat timeout, the
-worker *should* enter degraded mode (the same back-pressure signal). The payload
-change is wire-visible, so both sides upgrade together (Section 7).
+The PING payload changes in place from `[]` to `[int | None]`; the response is
+`PingResponse`, carrying the server's boot `server_epoch` (a per-process UUID).
+`None` marks an untracked prober, including schedulers with KV events disabled.
+Event-enabled schedulers pass their UUID-derived subscription identity; the
+event module refreshes the subscription without creating a transfer
+registration. PING keeps its BLOCKING dispatch on the NORMAL thread pool.
+SERIALIZED dispatch was considered but rejected: SERIALIZED runs on the MQ main
+loop, where a slow `REGISTER_KV_CACHE` (also SERIALIZED) would block PING and
+make a live worker look dead. Sharing the NORMAL pool is in fact desirable — if
+the pool cannot answer PING within the heartbeat timeout, the worker *should*
+enter degraded mode (the same back-pressure signal). Request and response shapes
+are wire-visible and type-checked across the transport, so both sides upgrade
+together (Section 7).
 
 ## 4. Instance ID Generation
 
@@ -144,15 +146,21 @@ the worker adapter warns at startup when `3 x interval` exceeds the 30 s floor.
 
 ### 6.1 Start policy
 
-The shared heartbeat does not choose its start time. vLLM and SGLang keep their
-lazy start on the first cache operation, while ATOM starts after successful
-KV-cache registration. The registration grace covers the lazy-start warmup
-window. Each adapter starts its heartbeat healthy, so initial work is not gated.
-A live worker then pings every interval, refreshing its server-side `last_seen`,
-so it is never reaped while alive. The recover callback re-registers only on a
-genuine recovery edge (Section 6.2). vLLM and SGLang report or return failed
-placeholders for cache work dropped while unhealthy, so their schedulers can
-recompute instead of hanging.
+The shared heartbeat does not choose its start time. vLLM and ATOM start it
+right after a successful KV-cache registration; SGLang keeps its lazy start on
+the first cache operation. Eager start matters because registration is when the
+server imports the worker's KV memory: a worker that dies during model warmup,
+before any store or retrieve, would otherwise stay never-pinged and be
+reclaimed only after the registration grace (1 h by default). Store/retrieve
+still call the start helper as an idempotent fallback. The registration grace
+covers adapters that genuinely have no liveness signal yet (SGLang's lazy
+window) and a crash inside the registration call itself. Each adapter starts
+its heartbeat healthy, so initial work is not gated. A live worker then pings
+every interval, refreshing its server-side `last_seen`, so it is never reaped
+while alive. The recover callback re-registers only on a genuine recovery edge
+(Section 6.2). vLLM and SGLang report or return failed placeholders for cache
+work dropped while unhealthy, so their schedulers can recompute instead of
+hanging.
 
 ### 6.2 Recovery after a reap
 
@@ -168,6 +176,15 @@ T1        recover callback re-registers (id absent -> fresh context) before
 A shorter outage hits the NOOP register path, which refreshes `last_seen` and
 builds nothing — the server never asks a worker to re-register.
 
+Recovery is not limited to the unhealthy edge. Every PING response carries the
+server's boot epoch; when it changes, the heartbeat runs the recover callback
+even though `was_healthy` and `healthy` are both true, and clears health during
+the callback so no transfer is admitted before re-registration. The vLLM worker
+also probes the epoch immediately before `REGISTER_KV_CACHE` and seeds the
+heartbeat with it, so a server replaced between registration and the first PING
+is caught as well. Without a seed (SGLang, ATOM), the first response adopts its
+epoch as the baseline, so startup never triggers a spurious re-registration.
+
 ### 6.3 Shutdown
 
 Adapter shutdown stops the heartbeat before sending UNREGISTER, so no stray ping
@@ -180,9 +197,11 @@ stop is already requested — a straggling cycle cannot re-create a ghost contex
 | Scenario | Behavior |
 |---|---|
 | Worker crash (SIGKILL, no UNREGISTER) after serving | Pings stop; reaped within ~`timeout + timeout/4`. Context, IPC handles, layout-desc refcount, and non-GPU strategy released via the same cleanup as a clean unregister; blend rope state dropped via the reap listener. The bug being fixed. |
-| Worker crash during warmup (registered, never pinged) | Reaped on the registration grace. Bounded leak instead of a permanent one. |
+| Worker crash during warmup (vLLM/ATOM, heartbeat already running) | Reaped on the short reap timeout, like any other crash: both adapters start the heartbeat right after successful registration, before the first store/retrieve. |
+| Worker crash during warmup (SGLang, or inside the registration call) | Never pinged; reaped on the registration grace. Bounded leak instead of a permanent one. |
 | Worker alive but never pinged, idle past the grace | Reaped while alive only if it never pinged (heartbeat never started). Once the heartbeat is running, pings refresh `last_seen` every interval, so a live worker is never reaped regardless of traffic. |
 | Heartbeat thread starved, worker transferring | Store/retrieve/prepare/commit refresh `last_seen`; never reaped. |
 | Partition shorter than the reap window | No reap. On heal, the recover callback re-registers; the NOOP path refreshes `last_seen`; zero context churn. |
+| Server restart shorter than the heartbeat interval | The changed boot epoch in the next PING runs recovery without an unhealthy edge, so the worker re-registers before traffic resumes. A restart between REGISTER and the first PING is caught by the epoch probed before registration. |
 | Worker crash + restart | The new process gets a fresh uuid-derived id and a fresh entry; the dead id is reaped independently. No PID-reuse aliasing. |
-| Mixed client/server versions | Every PING fails the payload-count check; the client sits permanently unhealthy. Loud, never silent corruption; upgrade both sides together. |
+| Mixed client/server versions | The PING request payload-count check or the response type check fails; the client sits permanently unhealthy. Loud, never silent corruption; upgrade both sides together. |

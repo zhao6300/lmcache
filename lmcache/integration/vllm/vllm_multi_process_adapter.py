@@ -34,7 +34,7 @@ from lmcache.utils import (
     _lmcache_nvtx_annotate,
     init_logger,
 )
-from lmcache.v1.client.heartbeat import HeartbeatThread
+from lmcache.v1.client.heartbeat import HeartbeatThread, send_ping
 from lmcache.v1.client.kv_event_subscriber import (
     KVEventStreamClosed,
     MPKVEventSubscriber,
@@ -1459,13 +1459,16 @@ class LMCacheMPWorkerAdapter:
         self._health_event = threading.Event()
         self._health_event.set()
 
-        # Heartbeat thread is created but NOT started yet.
-        # It will be lazily started on the first store or retrieve
-        # request, by which time vLLM is fully ready (model loaded,
-        # KV caches allocated, warmup & CUDA graph capture done).
+        # The heartbeat is not started yet: it starts right after KV cache
+        # registration succeeds, so the server can tell a live worker from a
+        # crashed one even before the first store or retrieve; store/retrieve
+        # keep calling _ensure_heartbeat_started as an idempotent fallback.
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat: HeartbeatThread | None = None
         self._heartbeat_lock = threading.Lock()
+        # Server boot epoch observed just before KV registration; the first
+        # heartbeat ping compares against it to catch a restart in between.
+        self._server_epoch: str | None = None
         if 3 * heartbeat_interval > _SERVER_REAP_TIMEOUT_FLOOR_SECONDS:
             logger.warning(
                 "lmcache.mp.heartbeat_interval is %.1fs, so 3 x "
@@ -1540,6 +1543,11 @@ class LMCacheMPWorkerAdapter:
         """
         Register the kv caches with LMCache server.
 
+        Starts the worker heartbeat on success, so a worker that dies during
+        model warmup (after registration but before its first store or
+        retrieve) is still reaped on the short worker reap timeout instead of
+        the registration grace.
+
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
@@ -1571,7 +1579,16 @@ class LMCacheMPWorkerAdapter:
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
-        self._send_register_kv_caches_request(kv_caches)
+        # Read the epoch before REGISTER so a replacement server that answers
+        # the first heartbeat ping afterwards is detected as a restart, not
+        # adopted as the baseline.
+        self._server_epoch = self._probe_server_epoch()
+        if self._send_register_kv_caches_request(kv_caches):
+            # The server now holds CUDA IPC mappings of this worker's KV
+            # memory. Start liveness before warmup and traffic, not with the
+            # first store/retrieve: a crash in between would otherwise leave
+            # those mappings resident until the registration grace expires.
+            self._ensure_heartbeat_started()
 
     def unregister_kv_caches(self) -> None:
         """Drop the server's registration of the KV caches so the engine can
@@ -1738,14 +1755,16 @@ class LMCacheMPWorkerAdapter:
         return True
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat on first store or retrieve.
+        """Start the heartbeat if it is not running yet.
 
-        The heartbeat starts healthy (the event was set at construction). A
-        live worker pings every interval, refreshing its server-side
-        ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        Starts healthy (the event was set at construction). A live worker
+        pings every interval, refreshing its server-side ``last_seen``, so it
+        is never reaped while alive -- no re-registration is needed at
+        startup, and the first store/retrieve is not gated. Called right after
+        a successful KV cache registration (covering a crash during warmup)
+        and again from store/retrieve as an idempotent fallback. The recover
+        callback still re-registers on a genuine unhealthy->healthy edge or a
+        server boot-epoch change.
         """
         if self._heartbeat is not None:
             return
@@ -1757,10 +1776,32 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
                 instance_id=self.instance_id,
+                initial_epoch=self._server_epoch,
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
             heartbeat.start()
             self._heartbeat = heartbeat
+
+    def _probe_server_epoch(self) -> str | None:
+        """Read the server's boot epoch before registration, best effort.
+
+        Returns:
+            The epoch, or ``None`` if the probe failed; the first successful
+            heartbeat ping then adopts its epoch as the baseline.
+        """
+        response = send_ping(
+            self.req_client,
+            timeout=self._heartbeat_interval,
+            instance_id=None,
+        )
+        if response is None:
+            logger.warning(
+                "Could not read the LMCache server epoch before KV cache "
+                "registration; a restart between registration and the first "
+                "heartbeat ping will not be detected"
+            )
+            return None
+        return response.server_epoch
 
     def _heartbeat_stop_requested(self) -> bool:
         """Whether a created heartbeat thread has a stop requested.

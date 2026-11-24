@@ -91,7 +91,7 @@ def native_client() -> Generator[RequestClient, None, None]:
         while time.monotonic() < deadline:
             assert process.is_alive(), f"MP server exited: {process.exitcode}"
             try:
-                if client.ping(None).result(timeout=0.5):
+                if client.ping(None).result(timeout=0.5) is not None:
                     break
             except LMCacheTimeoutError:
                 continue

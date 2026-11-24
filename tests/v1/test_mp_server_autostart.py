@@ -17,6 +17,7 @@ from lmcache.integration.vllm.mp_server_launcher import (
     maybe_start_mp_server_from_url,
     wait_for_mp_server_from_url,
 )
+from lmcache.v1.common.custom_types import PingResponse
 
 
 class FakeProcess:
@@ -74,7 +75,7 @@ class FakeMessageQueueClient:
     """Minimal message queue client double for health checks."""
 
     instances: list["FakeMessageQueueClient"] = []
-    future = FakeFuture(True)
+    future = FakeFuture(PingResponse(server_epoch="epoch-1"))
 
     def __init__(self, server_url: str, context: object) -> None:
         self.server_url = server_url
@@ -720,7 +721,7 @@ def test_launcher_early_exit_raises_connection_error(monkeypatch) -> None:
 
 def test_health_probe_sends_zmq_ping_and_closes_client(monkeypatch) -> None:
     FakeMessageQueueClient.instances = []
-    FakeMessageQueueClient.future = FakeFuture(True)
+    FakeMessageQueueClient.future = FakeFuture(PingResponse(server_epoch="epoch-1"))
     patch_mp_health_modules(monkeypatch)
     zmq_context = MagicMock()
 

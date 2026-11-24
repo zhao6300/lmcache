@@ -31,7 +31,7 @@ from lmcache.v1.client.transport.errors import (
     MPServerUnavailableError,
 )
 from lmcache.v1.client.transport.grpc_impl.client import GrpcMultiprocessClient
-from lmcache.v1.common.custom_types import KVEventBatch
+from lmcache.v1.common.custom_types import KVEventBatch, PingResponse
 from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.transport.grpc_impl.native_server import (
@@ -152,7 +152,7 @@ def test_handler_error_is_unknown_with_grpcio_message() -> None:
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             raise RuntimeError("handler failed")
 
     server = _serve([Module()])
@@ -204,8 +204,8 @@ def test_undecodable_request_is_internal() -> None:
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return True
+        def ping(self, instance_id: int | None) -> PingResponse:
+            return PingResponse()
 
     server = _serve([Module()])
     try:
@@ -223,8 +223,8 @@ def test_handler_returning_the_wrong_kind_is_unknown() -> None:
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return cast(bool, _idle_stream(closed))
+        def ping(self, instance_id: int | None) -> PingResponse:
+            return cast(PingResponse, _idle_stream(closed))
 
     server = _serve([Module()])
     client = _client(server)
@@ -370,9 +370,9 @@ def test_deadline_ends_unary_and_streaming_calls(blocked: threading.Event) -> No
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             blocked.wait(10)
-            return True
+            return PingResponse()
 
         @request_handler()
         def subscribe_kv_events(
@@ -404,10 +404,10 @@ def test_close_fails_calls_in_flight_and_is_idempotent(
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             entered.set()
             blocked.wait(10)
-            return True
+            return PingResponse()
 
     server = _serve([Module()])
     client = _client(server)
@@ -691,8 +691,8 @@ def test_failing_stream_close_callback_does_not_stop_the_server() -> None:
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return True
+        def ping(self, instance_id: int | None) -> PingResponse:
+            return PingResponse()
 
         @request_handler()
         def subscribe_kv_events(
@@ -712,7 +712,7 @@ def test_failing_stream_close_callback_does_not_stop_the_server() -> None:
         stream = client.subscribe_kv_events(1, "model", 0, 8)
         assert started.wait(5)
         stream.close()
-        assert client.ping(1).result(5) is True
+        assert client.ping(1).result(5) is not None
     finally:
         client.close()
         server.close()
@@ -761,8 +761,8 @@ def test_non_blocking_handlers_are_unimplemented() -> None:
 
     class Module:
         @request_handler(HandlerType.NON_BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return True
+        def ping(self, instance_id: int | None) -> PingResponse:
+            return PingResponse()
 
     server = _serve([Module()])
     client = _client(server)

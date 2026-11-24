@@ -38,6 +38,7 @@ from lmcache.v1.client.transport.errors import (
 from lmcache.v1.common.custom_types import (
     KVEventBatch,
     KVEventRecord,
+    PingResponse,
     RegisterKVCacheResponse,
 )
 from lmcache.v1.common.group_view import EngineGroupInfo
@@ -197,6 +198,8 @@ class FakeHeartbeatThread:
         health_event: threading.Event | None = None,
         interval: float = 0.0,
         instance_id: int | None = None,
+        *,
+        initial_epoch: str | None = None,
     ) -> None:
         self.req_client = req_client
         self.health_event = (
@@ -204,6 +207,7 @@ class FakeHeartbeatThread:
         )
         self.interval = interval
         self.instance_id = instance_id
+        self.initial_epoch = initial_epoch
         # Snapshot of the health event at construction time: lets tests
         # assert the adapter starts the heartbeat healthy (event still set).
         self.health_event_set_at_init = self.health_event.is_set()
@@ -396,6 +400,11 @@ def fake_adapter(monkeypatch):
     future = MagicMock(name="future")
     future.result.return_value = RegisterKVCacheResponse()
     _return_future_from_request_methods(req_client, future)
+    # The pre-registration epoch probe gets its own response; the registration
+    # future stays free for per-test success/failure overrides.
+    ping_future = MagicMock(name="ping_future")
+    ping_future.result.return_value = PingResponse(server_epoch="test-epoch")
+    req_client.ping.return_value = ping_future
     req_client.get_experimental.return_value = MagicMock()
     req_client.get_experimental.return_value.result.return_value = []
 
@@ -805,6 +814,36 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     req_client.register_kv_cache.assert_called_once()
 
 
+def test_register_kv_caches_starts_heartbeat_before_first_request(fake_adapter):
+    """A successful registration starts the heartbeat immediately.
+
+    The server holds CUDA IPC mappings of the worker's KV memory as soon as
+    REGISTER succeeds, so a worker that dies during model warmup (before any
+    store/retrieve) must still be ping-proven and reaped on the short reap
+    timeout, not the registration grace. The first store then reuses that
+    heartbeat instead of starting a second one.
+    """
+    adapter, _send_mock, _ = fake_adapter
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.instance_id == adapter.instance_id
+    # The pre-registration probe seeded the baseline, so a replacement server
+    # answering the first ping is detected as a restart.
+    assert heartbeat.initial_epoch == "test-epoch"
+    # Started healthy, with the recover callback wired before start().
+    assert heartbeat.health_event_set_at_init is True
+    assert heartbeat.calls == ["register_recover_callback", "start"]
+
+    adapter.transfer_ctx = MagicMock()
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    assert len(FakeHeartbeatThread.instances) == 1
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter
@@ -814,6 +853,10 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
         fake_tensor = MagicMock()
         fake_tensor.device.type = "cuda"
         adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    # A failed registration starts no heartbeat; there is no confirmed
+    # server-side mapping for it to keep alive.
+    assert FakeHeartbeatThread.instances == []
 
 
 def test_register_timeout_rolls_back_and_closes_unregistered_ctx(
@@ -1487,9 +1530,9 @@ def test_instance_id_logged_at_info_on_construction(fake_adapter, monkeypatch) -
 
 
 def test_heartbeat_lazy_start_wires_callback_before_start(fake_adapter) -> None:
-    """The lazy create path starts the heartbeat healthy (no pessimistic
-    clear) and wires the recover callback before ``start()``; the first
-    store is not gated. Idempotent on re-entry (no second thread)."""
+    """The store/retrieve fallback create path starts the heartbeat healthy
+    (no pessimistic clear) and wires the recover callback before ``start()``;
+    the first store is not gated. Idempotent on re-entry (no second thread)."""
     adapter, _send_mock, _ = fake_adapter
     adapter.transfer_ctx = MagicMock()
     assert adapter.is_healthy  # the constructor leaves the event set
@@ -1517,7 +1560,9 @@ def test_heartbeat_first_ping_runs_callback_before_setting_event() -> None:
     first successful ping invokes the recover callback while the event
     is still cleared, then sets the event."""
     req_client = MagicMock(name="req_client")
-    req_client.ping.return_value.result.return_value = True
+    req_client.ping.return_value.result.return_value = PingResponse(
+        server_epoch="epoch-1"
+    )
     health_event = threading.Event()  # cleared: pessimistic start state
     heartbeat = HeartbeatThread(
         req_client=req_client,
@@ -1538,6 +1583,74 @@ def test_heartbeat_first_ping_runs_callback_before_setting_event() -> None:
         heartbeat.stop(timeout=10.0)
 
     assert event_state_during_callback == [False]
+
+
+def test_heartbeat_epoch_change_recovers_while_still_healthy() -> None:
+    """A changed server boot epoch triggers recovery without a failed PING.
+
+    A server that restarts between two successful probes is otherwise
+    invisible to the heartbeat, leaving the client with a registration the
+    replacement server does not have. Health is cleared during the callback,
+    as on the unhealthy->healthy edge, so no transfer is admitted early.
+    """
+    req_client = MagicMock(name="req_client")
+    req_client.ping.return_value.result.return_value = PingResponse(
+        server_epoch="epoch-2"
+    )
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        req_client=req_client,
+        health_event=health_event,
+        interval=60.0,
+        initial_epoch="epoch-1",
+    )
+    event_state_during_callback: list[bool] = []
+
+    def recover() -> bool:
+        event_state_during_callback.append(health_event.is_set())
+        return True
+
+    heartbeat.register_recover_callback(recover)
+    try:
+        heartbeat.start()
+        deadline = time.time() + 10.0
+        while not event_state_during_callback and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        heartbeat.stop(timeout=10.0)
+
+    assert event_state_during_callback == [False]
+    assert health_event.is_set()
+
+
+def test_heartbeat_without_baseline_adopts_first_epoch() -> None:
+    """With no pre-registration baseline, the first response sets the baseline
+    instead of forcing a spurious re-registration at every startup."""
+    req_client = MagicMock(name="req_client")
+    req_client.ping.return_value.result.return_value = PingResponse(
+        server_epoch="epoch-1"
+    )
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        req_client=req_client,
+        health_event=health_event,
+        interval=60.0,
+    )
+    recover = MagicMock(name="recover", return_value=True)
+    heartbeat.register_recover_callback(recover)
+    try:
+        heartbeat.start()
+        deadline = time.time() + 10.0
+        while heartbeat.total_runs == 0 and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        heartbeat.stop(timeout=10.0)
+
+    assert heartbeat.total_runs == 1
+    recover.assert_not_called()
+    assert health_event.is_set()
 
 
 def test_dropped_retrieve_reported_once_via_unhealthy_get_finished(
@@ -1688,12 +1801,12 @@ def test_straggler_cycle_after_stop_skips_callback_and_event() -> None:
     ping_entered = threading.Event()
     release_ping = threading.Event()
 
-    def slow_ping(instance_id: int | None) -> MessagingFuture[bool]:
+    def slow_ping(instance_id: int | None) -> MessagingFuture[PingResponse]:
         del instance_id
         ping_entered.set()
         release_ping.wait(timeout=10.0)
-        future: MessagingFuture[bool] = MessagingFuture()
-        future.set_result(True)
+        future: MessagingFuture[PingResponse] = MessagingFuture()
+        future.set_result(PingResponse(server_epoch="epoch-1"))
         return future
 
     req_client = MagicMock(name="req_client")

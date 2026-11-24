@@ -39,6 +39,7 @@ from lmcache.v1.common.custom_types import (
     IPCCacheServerKey,
     KVEventBatch,
     KVEventRecord,
+    PingResponse,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
     RegisterEngineDrivenContextPayload,
@@ -222,8 +223,9 @@ def grpc_client(
             return RegisterEngineDrivenContextResponse("shared-memory", 4096)
 
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return instance_id == 7
+        def ping(self, instance_id: int | None) -> PingResponse:
+            assert instance_id == 7
+            return PingResponse(server_epoch="epoch-1")
 
         @request_handler(HandlerType.BLOCKING)
         def clear(self, force: bool = False) -> None:
@@ -808,7 +810,7 @@ def test_generated_grpc_services_communicate_end_to_end(
         )
     ).result(5)
     assert registration == RegisterEngineDrivenContextResponse("shared-memory", 4096)
-    assert client.ping(7).result(5) is True
+    assert client.ping(7).result(5).server_epoch == "epoch-1"
     assert client.clear().result(5) is None
     assert calls.clear_force is False
     assert client.clear(force=True).result(5) is None
@@ -885,10 +887,10 @@ def test_call_fails_like_a_timeout_when_the_server_goes_away(
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             entered.set()
             release.wait(10)
-            return True
+            return PingResponse()
 
     config = MPServerConfig(
         transport="grpc",
@@ -925,7 +927,7 @@ def test_grpc_server_keeps_handler_concurrency(grpc_server_mode: str) -> None:
 
     class Module:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             nonlocal running, peak
             with lock:
                 running += 1
@@ -933,7 +935,7 @@ def test_grpc_server_keeps_handler_concurrency(grpc_server_mode: str) -> None:
             time.sleep(0.02)
             with lock:
                 running -= 1
-            return True
+            return PingResponse()
 
         @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
         def clear(self, force: bool = False) -> None:
@@ -1046,12 +1048,12 @@ def test_grpc_normal_worker_limit_and_error_release(max_cpu_workers: int) -> Non
 
     class BlockingModule:
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
+        def ping(self, instance_id: int | None) -> PingResponse:
             entered.put(None)
             assert release.wait(10)
             if instance_id == 0:
                 raise RuntimeError("handler failed")
-            return True
+            return PingResponse()
 
     server = GrpcMultiprocessServer(
         "grpc://127.0.0.1:0",
@@ -1074,7 +1076,7 @@ def test_grpc_normal_worker_limit_and_error_release(max_cpu_workers: int) -> Non
         with pytest.raises(MPRequestError, match="handler failed"):
             futures[0].result(5)
         assert all(future.result(5) for future in futures[1:])
-        assert client.ping(1).result(5) is True
+        assert client.ping(1).result(5) is not None
     finally:
         release.set()
         client.close()

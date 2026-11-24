@@ -48,7 +48,8 @@ message PingRequest {
 }
 
 message PingResponse {
-  bool ok = 1;
+  // Identity of the server process; changes on every server restart.
+  string server_epoch = 1;
 }
 
 message BlockAllocationRecord {

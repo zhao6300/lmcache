@@ -21,12 +21,13 @@ def test_autostart_health_real_transport(start_server: bool) -> None:
         import sys
         import zmq
         from lmcache.integration.vllm.mp_server_launcher import is_mp_server_healthy
+        from lmcache.v1.common.custom_types import PingResponse
         from lmcache.v1.multiprocess.request_handler import HandlerType
         from lmcache.v1.multiprocess.transport.zmq_impl.mq import MessageQueueServer
 
-        def ping(instance_id: int | None) -> bool:
+        def ping(instance_id: int | None) -> PingResponse:
             assert instance_id is None
-            return True
+            return PingResponse(server_epoch="epoch-1")
 
         enabled = sys.argv[1] == 'True'
         context = zmq.Context()

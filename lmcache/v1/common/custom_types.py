@@ -422,3 +422,20 @@ class RegisterKVCacheResponse:
 
     succeed: bool = True
     error_message: str = ""
+
+
+@dataclass
+class PingResponse:
+    """Result of an MP server liveness probe.
+
+    A response is only produced by a live server, so receiving one is itself
+    the health signal.
+
+    Attributes:
+        server_epoch: Identity of the server process. It changes on every
+            server start, so a client can tell a server that kept its
+            in-memory registrations from a replacement that lost them. The
+            client re-registers when this value moves.
+    """
+
+    server_epoch: str = ""

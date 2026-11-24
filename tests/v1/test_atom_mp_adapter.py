@@ -19,6 +19,7 @@ from lmcache.integration.atom.multi_process_adapter import (
     AtomMPWorkerAdapter,
 )
 from lmcache.utils import EngineType
+from lmcache.v1.common.custom_types import PingResponse
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.kv_format import detect_format
 from lmcache.v1.common.kv_format.types import DiscoverableKVCache
@@ -302,7 +303,7 @@ def test_atom_heartbeat_runs_recovery_before_publishing_health(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful ping only restores health after re-registration succeeds."""
-    ping_results = iter([False, True])
+    ping_results = iter([None, PingResponse(server_epoch="epoch-1")])
 
     def ping(_instance_id: int) -> MessagingFuture[Any]:
         future: MessagingFuture[Any] = MessagingFuture()

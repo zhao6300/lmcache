@@ -223,9 +223,10 @@ Source: ``lmcache/v1/multiprocess/config.py``
    * - ``--worker-registration-grace-seconds``
      - ``3600.0``
      - Silence budget (seconds) for a worker that registered but has never
-       sent a PING (still warming up, or died before its first request).
+       sent a PING: an adapter that starts its heartbeat lazily on first
+       traffic, or death before the first PING (e.g. inside registration).
        Must be >= ``--worker-reap-timeout-seconds``. Generous by default so
-       slow model warmup is never mistaken for a dead worker.
+       a slow warmup is never mistaken for a dead worker.
    * - ``--kv-load-policy``
      - ``DEFAULT``
      - Per-request choice between serving a lookup and letting the engine

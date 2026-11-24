@@ -56,7 +56,7 @@ def _run_until_ready(args: list[str], port: int, log: Path) -> subprocess.Popen:
         while time.monotonic() < deadline:
             assert server.poll() is None, log.read_text()
             try:
-                if client.ping(1).result(2):
+                if client.ping(1).result(2) is not None:
                     return server
             except (TimeoutError, ConnectionError):
                 pass

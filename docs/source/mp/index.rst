@@ -241,7 +241,9 @@ name; see :doc:`request_transport` for endpoint selection and wire details.
      - Return the server's chunk size.
    * - ``PING``
      - BLOCKING
-     - Liveness ping; the handler always returns ``True``.
+     - Liveness ping; returns the server's per-process boot epoch so clients
+       detect a server restart and re-register without waiting for a failed
+       probe.
    * - ``REPORT_BLOCK_ALLOCATION``
      - BLOCKING
      - Fire-and-forget channel for the vLLM scheduler to report GPU block

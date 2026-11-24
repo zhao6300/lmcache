@@ -4,10 +4,11 @@
 # Standard
 from collections.abc import Sequence
 import threading
+import uuid
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.common.custom_types import BlockAllocationRecord
+from lmcache.v1.common.custom_types import BlockAllocationRecord, PingResponse
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
@@ -82,6 +83,10 @@ class ManagementModule(DiscoverableModule):
         self._reap_timeout = worker_reap_timeout_seconds
         self._reap_grace = worker_registration_grace_seconds
         self._experimental = tuple(experimental)
+        # Identifies this server process, not this deployment: a restart
+        # generates a new value. Clients compare it across PING responses to
+        # notice a replacement server that lost every in-memory registration.
+        self._server_epoch = uuid.uuid4().hex
 
         # Periodic reaper, started only when reaping is enabled and there is
         # something to scan. Scans every reap_timeout/4, so an instance is
@@ -127,7 +132,7 @@ class ManagementModule(DiscoverableModule):
             self._reaper.stop()
 
     @request_handler(HandlerType.BLOCKING)
-    def ping(self, instance_id: int | None) -> bool:
+    def ping(self, instance_id: int | None) -> PingResponse:
         """Respond to a ping and refresh the sender's liveness.
 
         Args:
@@ -136,12 +141,13 @@ class ManagementModule(DiscoverableModule):
                 last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            The response. A response itself proves the server is alive; its
+            ``server_epoch`` lets the sender detect a server restart.
         """
         if instance_id is not None:
             for target in self._liveness_targets:
                 target.touch_instance(instance_id)
-        return True
+        return PingResponse(server_epoch=self._server_epoch)
 
     def _reap_cycle(self) -> ThreadRunSummary:
         """Run one reaper scan: reap stale workers, drop mirrored state.

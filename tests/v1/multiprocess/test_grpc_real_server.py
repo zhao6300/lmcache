@@ -58,7 +58,7 @@ def _wait_ready(
     while time.monotonic() < deadline:
         assert server.poll() is None, log.read_text()
         try:
-            if client.ping(1).result(2):
+            if client.ping(1).result(2) is not None:
                 return
         except (TimeoutError, ConnectionError):
             pass
@@ -100,7 +100,7 @@ def test_client_recovers_after_the_server_crashes(
 
         waiting = client.ping(1)
         servers.append(_start(mode, port, log))
-        assert waiting.result(90), log.read_text()
-        assert client.ping(1).result(5)
+        assert waiting.result(90) is not None, log.read_text()
+        assert client.ping(1).result(5) is not None
     finally:
         client.close()

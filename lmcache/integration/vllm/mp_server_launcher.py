@@ -515,7 +515,8 @@ def is_mp_server_healthy(
         factory = _load_mp_health_dependencies()
         client = factory.create(server_url, context=zmq_context)
         future = client.ping(None)
-        return bool(future.result(timeout=timeout))
+        response = future.result(timeout=timeout)
+        return response is not None
     except Exception:
         logger.debug("LMCache MP server PING failed", exc_info=True)
         return False

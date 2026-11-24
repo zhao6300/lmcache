@@ -347,7 +347,7 @@ def test_build_modules_loads_plugin_and_registers_liveness_target(
     management = next(
         m for m in modules if isinstance(m, management_mod.ManagementModule)
     )
-    assert management.ping(123)
+    assert management.ping(123).server_epoch
     assert plugin_module.touched == [123]
     dependency = _FakePluginModule.last_dependency
     assert isinstance(dependency, lookup_mod.LookupModule)

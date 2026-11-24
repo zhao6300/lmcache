@@ -394,9 +394,21 @@ def test_management_ping_touches_targets() -> None:
     target = _FakeTarget()
     mgmt = ManagementModule(MagicMock(), liveness_targets=[target])
 
-    assert mgmt.ping(42) is True
-    assert mgmt.ping(None) is True
+    response = mgmt.ping(42)
+    assert response.server_epoch
+    assert mgmt.ping(None).server_epoch == response.server_epoch
     assert target.touched == [42]
+
+
+def test_management_ping_reports_one_epoch_per_server_instance() -> None:
+    """The epoch is stable for a server process and changes with a new one."""
+    first_server = ManagementModule(MagicMock())
+    second_server = ManagementModule(MagicMock())
+
+    epoch = first_server.ping(None).server_epoch
+    assert epoch
+    assert first_server.ping(42).server_epoch == epoch
+    assert second_server.ping(None).server_epoch != epoch
 
 
 def test_management_clear_defaults_to_non_force() -> None:
@@ -444,7 +456,7 @@ def test_management_reaper_disabled_when_timeout_zero() -> None:
         worker_reap_timeout_seconds=0.0,
     )
     assert mgmt._reaper is None
-    assert mgmt.ping(1) is True
+    assert mgmt.ping(1).server_epoch
 
 
 def test_management_report_status_summarizes_liveness() -> None:
@@ -888,7 +900,7 @@ def test_event_subscription_pushes_without_polling_and_keeps_requests_live(
             streams.append(stream)
             assert pool.submit(next, stream).result(timeout=5).events == []
         waiting_readers = [pool.submit(next, stream) for stream in streams]
-        assert client.ping(0).result(timeout=5)
+        assert client.ping(0).result(timeout=5) is not None
         assert all(not future.done() for future in waiting_readers)
 
         key = _event_key(1)
