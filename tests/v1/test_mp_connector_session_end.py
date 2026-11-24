@@ -421,3 +421,33 @@ class TestEndSessionDelivery:
         connector.scheduler_adapter.end_session.assert_called_once_with(
             "req-9", SessionEndInfo()
         )
+
+
+class TestFinishedRequestTracking:
+    """Which finished requests the connector delays and later reports."""
+
+    def test_producer_tracks_a_request_that_scheduled_no_store(self):
+        """A request that stores nothing still has to reach finished_sending.
+
+        A producer delays every finished request's free. Reporting is filtered
+        to the ids that delayed it, so an untracked id is never reported and
+        vLLM would hold its blocks forever (e.g. a fully cache-hit repeat).
+        """
+        connector = _scheduler_connector(lazy_offload=False)
+        connector.worker_adapter = MagicMock()
+        connector.worker_adapter.get_finished.return_value = ({"req-1"}, set())
+        request = _finished_request()
+        assert connector.request_trackers == {}
+
+        delay_free, _ = LMCacheMPConnector.request_finished(
+            cast(LMCacheMPConnector, connector), request, block_ids=[]
+        )
+        assert delay_free
+        assert connector._delay_free_req_ids == {"req-1"}
+
+        sending, receiving = LMCacheMPConnector.get_finished(
+            cast(LMCacheMPConnector, connector), {"req-1"}
+        )
+        assert sending == {"req-1"}
+        assert receiving == set()
+        assert connector._delay_free_req_ids == set()

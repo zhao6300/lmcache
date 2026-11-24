@@ -2058,9 +2058,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id, end_info)
+        # A producer delays every free so the worker can confirm it holds no
+        # store for the request. Track whichever ids are actually delayed;
+        # vLLM would never see finished_sending for an untracked id and leak
+        # its blocks.
+        delay_free = delay_free or self._can_store
         if delay_free:
             self._delay_free_req_ids.add(request.request_id)
-        return delay_free or self._can_store, (return_params or None)
+        return delay_free, (return_params or None)
 
     def request_finished_all_groups(
         self,
